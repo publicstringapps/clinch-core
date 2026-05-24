@@ -14,7 +14,11 @@ function toHex(arr: Uint8Array | number[]): string {
 }
 
 function fromHex(hex: string): Uint8Array {
-    return new Uint8Array(hex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
+    // Strips all spaces, newlines, and rogue quotes from .env strings
+    const clean = hex.replace(/[^0-9a-fA-F]/g, '');
+    const match = clean.match(/.{1,2}/g);
+    if (!match) return new Uint8Array(0);
+    return new Uint8Array(match.map(byte => parseInt(byte, 16)));
 }
 
 // ============================================================================
@@ -56,11 +60,9 @@ export interface SessionState {
     exitTokenHash?: string;
     constraints: ConstraintVector;
     
-    // Isolated State Tracking (Crucial for concurrency)
     currentTurn: number;
     lastKnownPrice: number;
 
-    // Local LLM Context Tracking
     sandboxSequence?: any; 
     sandboxSession?: any;
 }
@@ -95,12 +97,10 @@ export class ClinchCore extends EventEmitter {
     private activeSessions = new Map<string, SessionState>();
     private ws: WebSocket | null = null;
 
-    // Sandbox Engine Base (Model/Context are global, Sequences are per-session)
     private isSandboxMode = false;
     private sandboxModelContext: any = null;
     private sandboxMaxTurns = 6;
 
-    // Legacy support for single-tenant applications checking the last ID
     public get activeNegotiationId(): string | null {
         return Array.from(this.activeSessions.keys()).pop() || null;
     }
@@ -266,9 +266,6 @@ export class ClinchCore extends EventEmitter {
         if (this.ws) { this.ws.close(); this.ws = null; }
     }
 
-    // --------------------------------------------------------------------------
-    // SESSION STATE MANAGEMENT (For Enterprise Horizontal Scaling & Reconnects)
-    // --------------------------------------------------------------------------
     public exportSessionState(sessionId: string): string {
         const session = this.activeSessions.get(sessionId);
         if (!session) throw new Error("Session not found");
@@ -289,7 +286,6 @@ export class ClinchCore extends EventEmitter {
 
     public importSessionState(serializedData: string): void {
         const data = JSON.parse(serializedData);
-        
         const secretKey = fromHex(data.ephemeralSecretKeyHex);
         const keyPair = nacl.sign.keyPair.fromSecretKey(secretKey);
 
@@ -311,9 +307,6 @@ export class ClinchCore extends EventEmitter {
         return this.activeSessions.get(sessionId);
     }
 
-    // --------------------------------------------------------------------------
-    // UNIVERSAL PROMPT BUILDER
-    // --------------------------------------------------------------------------
     public buildAgentPrompt(sessionId: string, incomingMessage: string): string {
         const session = this.activeSessions.get(sessionId);
         if (!session) throw new Error("Cannot build prompt: Session not found.");
@@ -350,9 +343,6 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 }`;
     }
 
-    // --------------------------------------------------------------------------
-    // PROTOCOL OPERATIONS
-    // --------------------------------------------------------------------------
     async search(query: string, mode?: string): Promise<any> {
         let url = `/api/discover?category=${encodeURIComponent(query)}`;
         if (mode) url += `&mode=${encodeURIComponent(mode)}`;
@@ -414,7 +404,6 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
             body: JSON.stringify({ ...payload, buyer_sig })
         });
 
-        // Sync state if deal reached
         if (response.msg_type === 'accept' || response.status === 'COMMITTED') {
             session.status = 'CLOSED';
             session.lastKnownPrice = response.price || price;
@@ -437,9 +426,6 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         return res.token_hash;
     }
 
-    // --------------------------------------------------------------------------
-    // OUT-OF-THE-BOX SANDBOX (AUTO-TURN ENGINE)
-    // --------------------------------------------------------------------------
     async sandbox(config: SandboxConfig = {}): Promise<void> {
         this.isSandboxMode = true;
         this.sandboxMaxTurns = config.maxTurns || 6;
@@ -455,7 +441,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
     }
 
     private async setupSandbox(config: SandboxConfig = {}): Promise<void> {
-        if (this.sandboxModelContext) return; // Already initialized
+        if (this.sandboxModelContext) return; 
 
         const settings = {
             downloadLLM: true,
@@ -546,7 +532,6 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 
         const systemPrompt = this.buildAgentPrompt(session.sessionId, incomingOffer);
 
-        // State Isolation: Bind sequence to the session, not the global class!
         if (!session.sandboxSequence) {
             session.sandboxSequence = this.sandboxModelContext.getSequence();
             session.sandboxSession = new LlamaChatSession({
@@ -565,9 +550,6 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         return responseText;
     }
 
-    // --------------------------------------------------------------------------
-    // UTILITIES
-    // --------------------------------------------------------------------------
     private extractPrice(text: string, prefix: string): number | null {
         const regex = new RegExp(`${prefix}\\s*\\:?\\s*\\$?(\\d+(?:\\.\\d{2})?)`, 'i');
         const match = text.match(regex);
@@ -623,7 +605,7 @@ export interface SellerRecord {
   supported_modes: string[];
   categories:      string[];
   capabilities:    string[];
-  display_name?:   string; // Optional legacy support
+  display_name?:   string; 
 }
 
 export class ClinchSeller extends EventEmitter {
@@ -637,10 +619,18 @@ export class ClinchSeller extends EventEmitter {
     this.config = { timeoutMs: 8000, ...config };
 
     if (config.privateKeyHex) {
-      this.identityPrivKey = fromHex(config.privateKeyHex);
-      const kp = nacl.sign.keyPair.fromSecretKey(this.identityPrivKey);
-      this.identityPubKey = toHex(kp.publicKey);
-      this.emit('log', `[Seller] Loaded permanent identity. PubKey: ${this.identityPubKey.substring(0, 12)}...`);
+      try {
+        const cleanHex = config.privateKeyHex.replace(/[^0-9a-fA-F]/g, '');
+        if (cleanHex.length !== 128) {
+            throw new Error(`Expected 128 hex chars (64 bytes), got ${cleanHex.length}`);
+        }
+        this.identityPrivKey = fromHex(cleanHex);
+        const kp = nacl.sign.keyPair.fromSecretKey(this.identityPrivKey);
+        this.identityPubKey = toHex(kp.publicKey);
+        this.emit('log', `[Seller] Loaded permanent identity. PubKey: ${this.identityPubKey.substring(0, 12)}...`);
+      } catch (e: any) {
+        throw new Error(`[Seller] Invalid privateKeyHex in constructor: ${e.message}`);
+      }
     } else {
       const kp = nacl.sign.keyPair();
       this.identityPrivKey = kp.secretKey;
