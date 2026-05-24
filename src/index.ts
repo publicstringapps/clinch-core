@@ -574,7 +574,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
     }
 
     public parseAddress(address: string): ParsedAddress {
-        if (!address.includes('.')) throw new Error("Invalid Address Format. Expected MODE.domain (e.g. ANP/A.amazon.anp)");
+        if (!address.includes('.')) throw new Error("Invalid Address Format. Expected MODE.domain (e.g. ANP/C.amazon.anp)");
         
         const firstDotIdx = address.indexOf('.');
         const mode = address.substring(0, firstDotIdx);
@@ -607,4 +607,85 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         }
         return zeroBits >= bits;
     }
+}
+
+// ============================================================================
+// THE CLINCH SELLER LIBRARY (Server-Side)
+// ============================================================================
+export interface SellerRecord {
+  agent_id:        string;
+  endpoint:        string;
+  supported_modes: string[];
+  categories:      string[];
+  capabilities:    string[];
+}
+
+export class ClinchSeller extends EventEmitter {
+  private config:           ClinchConfig;
+  private cachedRegistryUrl: string | null = null;
+  private identityPrivKey:  Uint8Array;
+  public  identityPubKey:   string;
+
+  constructor(config: ClinchConfig & { privateKeyHex?: string } = {}) {
+    super();
+    this.config = { timeoutMs: 8000, ...config };
+
+    if (config.privateKeyHex) {
+      this.identityPrivKey = fromHex(config.privateKeyHex);
+      const kp = nacl.sign.keyPair.fromSecretKey(this.identityPrivKey);
+      this.identityPubKey = toHex(kp.publicKey);
+      this.emit('log', `[Seller] Loaded permanent identity. PubKey: ${this.identityPubKey.substring(0, 12)}...`);
+    } else {
+      const kp = nacl.sign.keyPair();
+      this.identityPrivKey = kp.secretKey;
+      this.identityPubKey  = toHex(kp.publicKey);
+      console.warn('[Seller] ⚠️  No privateKeyHex provided — using ephemeral key. Registry will reject updates unless this key is pre-registered.');
+    }
+
+    if (this.config.registryUrl) {
+      this.cachedRegistryUrl = this.config.registryUrl;
+    }
+  }
+
+  private async resolveRegistry(): Promise<string> {
+    if (this.cachedRegistryUrl) return this.cachedRegistryUrl;
+    const res = await fetch(FIREBASE_CONFIG_URL);
+    const cfg = JSON.parse(await res.text());
+    this.cachedRegistryUrl = cfg.registry_nodes[PROTOCOL_VERSION];
+    return this.cachedRegistryUrl!;
+  }
+
+  async registerEndpoint(record: SellerRecord): Promise<any> {
+    const registry = await this.resolveRegistry();
+
+    const payload = { ...record, timestamp: Date.now() };
+    const msgUint8 = new TextEncoder().encode(JSON.stringify(payload));
+    const signature = toHex(nacl.sign.detached(msgUint8, this.identityPrivKey));
+
+    const res = await fetch(`${registry}/api/sellers/update-endpoint`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        payload,
+        public_key: this.identityPubKey,
+        signature
+      })
+    });
+
+    if (!res.ok) throw new Error(`Endpoint registration failed: ${await res.text()}`);
+    const data = await res.json();
+    this.emit('log', `[Seller] Registered: ${record.agent_id} → ${record.endpoint}`);
+    return data;
+  }
+
+  verifyBuyerSignature(payload: any, signatureHex: string, buyerPubKeyHex: string): boolean {
+    try {
+      const msg    = new TextEncoder().encode(JSON.stringify(payload));
+      const sig    = fromHex(signatureHex);
+      const pubKey = fromHex(buyerPubKeyHex);
+      return nacl.sign.detached.verify(msg, sig, pubKey);
+    } catch {
+      return false;
+    }
+  }
 }
