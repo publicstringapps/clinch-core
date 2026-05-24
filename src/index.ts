@@ -100,6 +100,11 @@ export class ClinchCore extends EventEmitter {
     private sandboxModelContext: any = null;
     private sandboxMaxTurns = 6;
 
+    // Legacy support for single-tenant applications checking the last ID
+    public get activeNegotiationId(): string | null {
+        return Array.from(this.activeSessions.keys()).pop() || null;
+    }
+
     constructor(config: ClinchConfig = {}) {
         super();
         this.config = { timeoutMs: 5000, ...config };
@@ -618,6 +623,7 @@ export interface SellerRecord {
   supported_modes: string[];
   categories:      string[];
   capabilities:    string[];
+  display_name?:   string; // Optional legacy support
 }
 
 export class ClinchSeller extends EventEmitter {
