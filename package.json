@@ -1,6 +1,6 @@
 {
   "name": "clinch-core",
-  "version": "0.6.1",
+  "version": "0.6.2",
 
   "description": "Clinch Protocol Edge Client",
   "main": "dist/index.js",
@@ -20,9 +20,8 @@
   "dependencies": {
     "js-sha256": "^0.11.1",
     "tweetnacl": "^1.0.3",
-    "ws": "^8.20.1"
-  },
-  "peerDependencies":{
+    "ws": "^8.20.1",
     "node-llama-cpp": "^3.18.1"
   }
+  
 }
