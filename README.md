@@ -1,110 +1,121 @@
 # Clinch Core (`clinch-core`)
 
-> **Autonomous Agent Negotiation Mediation Protocol — Edge Client & Seller SDK**
+> **Agent Negotiation Protocol (ANP) — Edge Client & Seller SDK**
 
-Clinch is a modular, edge-first protocol designed to mediate autonomous negotiations between a buyer AI agent and a seller AI agent. It allows agents to negotiate price and terms to a mutual, mathematically converged agreement without a human in the loop, and without the seller ever seeing the buyer's full profile.
-
-Once an agreement is reached, Clinch issues a **cryptographically co-signed deal artifact** held by both parties. This SDK provides the complete network client, state-isolated session management, cryptographic signing engines, an optional out-of-the-box local LLM bargaining sandbox, and the server-side Seller SDK.
+`clinch-core` is the programmatic engine of the Clinch Protocol. It provides the state machine, cryptographic signing interfaces, local LLM sandbox adapters, and server-side utilities required to implement both buyer and seller agents conforming to the **Agent Negotiation Protocol (ANP)**.
 
 ---
 
-## 🎯 Project Aim & Philosophy
+## 1. Protocol Architecture & Mechanics
 
-In the modern web, purchasing, SaaS licensing, transport, and commodity procurement involve endless manual comparisons, form-filling, and back-and-forth communication. Clinch replaces this overhead by allowing buyers to delegate constraints to a local agent that negotiates autonomously with the seller's hosted agent.
+The Agent Negotiation Protocol (ANP) governs how two autonomous software agents establish identity, declare capabilities, and reach a cryptographically verifiable agreement on price and terms.
 
-*   **Buyer Anonymity First**: The seller receives a simplified constraint vector (e.g., budget bracket, target category) rather than the buyer’s identity, private data, or raw history. All counter-offers are routed through the Registry proxy, guaranteeing 100% IP anonymity for the buyer.
-*   **Edge-First Execution**: The buyer agent runs locally on-device. This SDK supports dynamically importing and running optimized 1.5B 4-bit quantized models in under **1.3 GB of RAM**, making it compatible with consumer hardware.
-*   **Enterprise Concurrency**: Complete session isolation allows scaling horizontally. You can run hundreds of concurrent negotiations on a single server, serialize state, and resume negotiations across pod restarts or delayed webhooks.
-*   **Cryptographic Accountability**: Identity is proven via Ed25519 keys and Proof-of-Work (PoW). The final co-signed deal artifact is self-verifying against the Registry's daily rotating key chain. Zero-trust machine-to-machine updates are enforced without centralized JWT expirations.
+### 1.1 Address Formatting & Routing
+All destination routing in Clinch relies on strict, structured addressing:
+
+$$\text{PROTOCOL\_MODE} \mathbin{.} \text{domain} \mathbin{.} \text{TLD}$$
+
+*Example:* `ANP/C.amazon.anp`
+
+The SDK parses the address to extract the negotiated **Protocol Mode** and target namespace domain before dispatching the initialization request.
+
+### 1.2 Protocol Modes
+Sellers declare which execution profiles they support. The SDK maps these mode flags to session parameters during handshake:
+
+*   **`ANP/A`**: Standard native execution. Both buyer and seller agents run the local Clinch edge model. Best suited for high-volume, low-friction commodity exchanges.
+*   **`ANP/B`**: Mixed execution. One side uses the native edge model, while the other runs a custom model or external API adapter.
+*   **`ANP/C`**: Custom integration. Both agents run custom decision engines (e.g., GPT-4o, Claude 3.5, or proprietary heuristics). 
 
 ---
 
-## 📦 Installation
+## 2. State Machine & Event Architecture
 
-To use `clinch-core` as a raw network client (Bring Your Own LLM or Seller Node):
+The SDK maintains an isolated, turn-based state machine for each active session. 
+
+### Core Statuses (`CoreStatus`)
+*   `OFFLINE`: Client is completely disconnected.
+*   `CONNECTING`: Authenticating identity and performing local Proof-of-Work (PoW) verification.
+*   `IDLE`: Connected and authenticated. Ready to initialize new sessions.
+*   `NEGOTIATING`: Active, turn-based bargaining sequence in progress.
+*   `CONVERGED`: Mathematical convergence reached; agreement co-signed.
+*   `STALEMATE`: Handshake or negotiation sequence aborted or timed out.
+*   `ERROR`: Internal network, compilation, or cryptographic validation failure.
+
+### Developer Event Subscriptions
+```typescript
+// Track the operational status of the client
+core.on('status_changed', (status: CoreStatus) => {
+    console.log(`[Status] Client changed to: ${status}`);
+});
+
+// Fired when a new negotiation handshake is completed
+core.on('session_started', ({ sessionId, sellerId }) => {
+    console.log(`[Session Started] Active ID: ${sessionId} targeting ${sellerId}`);
+});
+
+// Fired when a session reaches terminal state (deal converged or stalemate)
+core.on('session_closed', ({ sessionId, outcome, finalPrice }) => {
+    console.log(`[Session Closed] ID: ${sessionId} | Outcome: ${outcome} | Price: $${finalPrice}`);
+});
+
+// Fired when an out-of-band message is received via the WS callback channel
+core.on('callback_received', ({ sessionId, payload }) => {
+    console.log(`[Callback] Re-engagement for session ${sessionId} received`);
+});
+```
+
+---
+
+## 3. Installation
+
+Install the library using your package manager:
 ```bash
 npm install clinch-core
 ```
 
-If you wish to use the **out-of-the-box local Sandbox engine** (Buyer Edge Mode), install the required peer dependency:
+To run the local autonomous **Sandbox engine**, install the required peer dependency:
 ```bash
 npm install node-llama-cpp
 ```
-*(Note: `node-llama-cpp` is dynamically imported. Web/React Native builds will not fail if this is missing, provided `.sandbox()` is not called).*
+*(Note: `node-llama-cpp` is dynamically imported at runtime. Web builds or headless environments will not fail if this dependency is omitted, provided `.sandbox()` is not invoked).*
 
 ---
 
-## 🚦 Core State Machine & Event Architecture
+## 4. Integration Guide: Buyer Agents
 
-`clinch-core` is driven by a strict network and negotiation state machine. You can subscribe to state transitions and real-time transaction logging to build clean, reactive user interfaces.
-
-### Core Statuses (`CoreStatus`)
-*   `OFFLINE`: Client is disconnected.
-*   `CONNECTING`: Resolving registry configuration and performing Proof-of-Work auth.
-*   `IDLE`: Connected and authenticated. Waiting for handshakes or callbacks.
-*   `RECONNECTING`: Socket connection lost; executing exponential backoff.
-*   `NEGOTIATING`: Active turn-based negotiation sequence in progress.
-*   `CONVERGED`: Mathematical agreement reached successfully.
-*   `STALEMATE`: Negotiation terminated; max turns reached without convergence.
-*   `ERROR`: Internal network, cryptographic, or compilation failure.
-
-### Event Emitters
-```typescript
-core.on('status_changed', (status: CoreStatus) => {
-    console.log(`State transitioned to: ${status}`);
-});
-
-core.on('session_started', ({ sessionId, sellerId }) => {
-    console.log(`Negotiation initiated with ${sellerId} (Session: ${sessionId})`);
-});
-
-core.on('session_closed', ({ sessionId, outcome, finalPrice }) => {
-    console.log(`Session ${sessionId} closed. Outcome: ${outcome} at $${finalPrice}`);
-});
-
-core.on('callback_received', ({ sessionId, payload }) => {
-    // Fired when the seller routes a callback counter-offer via the Registry WS
-});
-```
-
----
-
-## ⚡ Quickstart: Out-of-the-Box Sandbox (Buyer)
-
-The Sandbox automatically downloads an optimized **Qwen 2.5 1.5B Q4_K_M** model (~1.1GB), loads it securely into local RAM, and automatically wires up the WebSocket listeners to negotiate autonomously on incoming network events.
+### 4.1 Running the On-Device Sandbox
+The local Sandbox runs an optimized **Qwen 2.5 1.5B Q4_K_M** model on local hardware resources. It automatically handles handshake math and turn-based counter-offers based on your strict constraints.
 
 ```javascript
 const { ClinchCore } = require('clinch-core');
 
-async function startLocalAgent() {
+async function runAutonomousSession() {
     const core = new ClinchCore();
 
     core.on('log', (msg) => console.log(msg));
-    core.on('session_closed', ({ finalPrice }) => console.log(`Deal secured at $${finalPrice}!`));
+    core.on('session_closed', ({ finalPrice }) => {
+        console.log(`✓ Negotiation completed at $${finalPrice}`);
+    });
 
-    // 1. Initialize Sandbox: Handles network auth, downloads GGUF, & registers auto-listeners
+    // 1. Initialize local LLM, solve PoW, and connect WebSocket
     await core.sandbox({ downloadLLM: true });
 
-    // 2. Initiate Negotiation: Session automatically transitions to 'NEGOTIATING'
-    // Format: PROTOCOL_MODE.domain.anp (e.g., ANP/C.amazon.anp)
+    // 2. Begin autonomous negotiation
     const sessionId = await core.negotiate('ANP/C.amazon.anp', {
         intent: 'purchase',
         category: 'electronics',
         item: 'Ninja Blender',
-        max_budget: 85.00 // Strictly enforced constraint
+        max_budget: 85.00
     });
 
-    console.log(`🤖 Auto-agent listening on Session ${sessionId}`);
+    console.log(`Session active: ${sessionId}`);
 }
 
-startLocalAgent();
+runAutonomousSession();
 ```
 
----
-
-## 🔌 Quickstart: Bring Your Own AI & Webhook Persistence
-
-If you are running in a cloud environment (e.g., handling webhooks) and want to leverage high-end hosted APIs (e.g. Claude 3.5 Sonnet or OpenAI GPT-4o), bypass the sandbox. The Core provides **State Serialization** to survive server restarts.
+### 4.2 Cloud Webhook & Horizontal Scale Pattern
+For enterprise cloud environments where processes must remain stateless or scale horizontally across server pods, you must serialize and rehydrate active sessions dynamically. This ensures that when an asynchronous callback arrives, any pod can load the session state and use the matching ephemeral key to sign the next turn.
 
 ```javascript
 import { ClinchCore } from 'clinch-core';
@@ -113,54 +124,59 @@ import Anthropic from '@anthropic-ai/sdk';
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const core = new ClinchCore();
 
-await core.initialize(); 
+await core.initialize();
 
-// 1. Start session and save state to DB
+// 1. Start session
 const sessionId = await core.negotiate('ANP/C.amazon.anp', {
     intent: 'purchase',
     item: 'Ninja Blender',
     max_budget: 85.00
 });
-const savedState = core.exportSessionState(sessionId);
-await db.save(sessionId, savedState);
 
-// --- LATER, ON A DIFFERENT SERVER OR WEBHOOK --- //
+// 2. Serialize and persist the state to your DB (Redis, Postgres, etc.)
+const exportedState = core.exportSessionState(sessionId);
+await db.saveSession(sessionId, exportedState);
+
+// --- LATER, ON A DIFFERENT POD OR ASYNCHRONOUS WEBHOOK TRIGGER --- //
 
 const webhookCore = new ClinchCore();
-webhookCore.importSessionState(savedState);
+webhookCore.importSessionState(exportedState);
 
 webhookCore.on('callback_received', async (event) => {
-    // 2. Let the Core build the perfect state-aware protocol prompt
+    // 3. Generate system prompt using rehydrated session data
     const systemPrompt = webhookCore.buildAgentPrompt(event.sessionId, event.payload.message);
 
-    // 3. Feed it to Claude/OpenAI
+    // 4. Evaluate with hosted LLM
     const msg = await anthropic.messages.create({
       model: "claude-3-5-sonnet-20241022",
       maxTokens: 150,
       system: systemPrompt,
-      messages: [{ role: "user", content: "Determine our next protocol move." }]
+      messages: [{ role: "user", content: "Calculate next move." }]
     });
 
-    const aiDecision = JSON.parse(msg.content[0].text);
+    const decision = JSON.parse(msg.content[0].text);
 
-    // 4. Act on the deterministic JSON response
-    if (aiDecision.action === 'accept') {
-        console.log("Deal reached!");
+    // 5. Submit cryptographic counter-offer
+    if (decision.action === 'accept') {
+        console.log("Agreement reached!");
     } else {
-        await webhookCore.sendCounter(event.sessionId, aiDecision.price, aiDecision.message);
-        // Reserialize and update DB after turn to maintain state sync
-        await db.update(event.sessionId, webhookCore.exportSessionState(event.sessionId));
+        await webhookCore.sendCounter(event.sessionId, decision.price, decision.message);
+        // 6. Update DB with new turn state and counters
+        await db.updateSession(event.sessionId, webhookCore.exportSessionState(event.sessionId));
     }
 });
 ```
 
 ---
 
-## 🏪 Quickstart: Building a Seller Node
+## 5. Integration Guide: Seller Nodes
 
-`clinch-core` exports the `ClinchSeller` class to make building a native seller server seamless.
+Sellers use the `ClinchSeller` class to build compliant, automated endpoints. 
 
-**Architecture Note:** Seller Nodes do not use JWTs. You generate a permanent Ed25519 Keypair in the Clinch Dashboard, claim your domain, and pass the private key to your Node. The node securely self-publishes its endpoint and capabilities on boot.
+### 5.1 Decoupled Routing Architecture
+To prevent centralized token expiration failures, Clinch separates ownership from routing:
+1. **The Control Plane**: The merchant claims their domain name (e.g., `amazon.anp`) and binds their permanent public key to it once using the dashboard.
+2. **The Data Plane**: The actual seller server is initialized with the matching permanent private key. On boot, the machine signs its dynamic endpoint configuration locally and publishes it to the registry. No JWTs are used on-wire for machine routing.
 
 ```javascript
 import { ClinchSeller } from 'clinch-core';
@@ -169,13 +185,12 @@ import express from 'express';
 const app = express();
 app.use(express.json());
 
-// Initialize with your permanent Dashboard-generated Private Key
+// 1. Initialize seller with the permanent cryptographic key
 const seller = new ClinchSeller({ 
     privateKeyHex: process.env.SELLER_PRIVATE_KEY 
-    // registryUrl: 'http://localhost:7860' // Optional: Override for local dev
 });
 
-// Publish your routing endpoint to the network on boot
+// 2. Publish endpoint to the registry on boot (Self-Signing)
 await seller.registerEndpoint({
     agent_id: 'amazon.anp',
     endpoint: 'https://your-seller-api.com/anp/v1',
@@ -184,21 +199,21 @@ await seller.registerEndpoint({
     capabilities: ['price_flex']
 });
 
-// Create your counter-offer route
+// 3. Implement the standard ANP counter-offer endpoint
 app.post('/anp/v1/counter', (req, res) => {
     const { session_id, turn, price, reason, buyer_sig } = req.body;
 
-    // Verify the payload actually came from the buyer who holds the session key
+    // Cryptographically verify the buyer's ephemeral signature
     const isValid = seller.verifyBuyerSignature(
         { session_id, turn, price, reason },
         buyer_sig,
         req.headers['x-buyer-pubkey']
     );
 
-    if (!isValid) return res.status(401).send("Invalid signature");
+    if (!isValid) return res.status(401).json({ error: "Invalid signature" });
 
-    // Process logic and return standard counter JSON...
-    res.json({ msg_type: 'counter', price: 95.00, reason: "Best I can do is $95." });
+    // Execute bargaining logic and respond
+    res.json({ msg_type: 'counter', price: 95.00, reason: "Best we can offer is $95." });
 });
 
 app.listen(8080);
@@ -206,57 +221,55 @@ app.listen(8080);
 
 ---
 
-## 📖 API Reference
+## 6. API Reference
 
-### Buyer Client (`ClinchCore`)
+### 6.1 `ClinchCore` (Buyer Client)
 
 #### `new ClinchCore(config)`
-*   `config.registryUrl` *(string)*: Override default dynamic configuration resolution for local testing.
-*   `config.timeoutMs` *(number)*: Connection timeout limit (Default: `5000`ms).
+*   `config.registryUrl` *(string)*: Optional. Direct override pointing to a local development registry.
+*   `config.timeoutMs` *(number)*: Network connection timeout limit (Default: `5000`ms).
 
 #### `async initialize(cachedToken?)`
-Authenticates the node on the network, completes Identity-Bound PoW, and connects the WebSocket.
-*   `cachedToken` *(string)*: Optional. Re-use an existing network token to bypass PoW calculations on restart.
+Resolves network configurations, computes Proof-of-Work proof, and opens active WebSocket channels.
+*   `cachedToken` *(string)*: Optional. Pastes a previous registry authorization token to skip PoW calculations on startup.
 
 #### `async negotiate(address, constraints)`
-Launches a cryptographic session handshake. Returns `sessionId`.
-*   `address` *(string)*: Target seller address. Must include the protocol mode prefix (e.g., `ANP/C.amazon.anp`).
-*   `constraints` *(ConstraintVector)*: Must include `max_budget` (number) and `item` (string).
+Initializes the cryptographic handshake with a seller. Returns `sessionId`.
+*   `address` *(string)*: Target address formatted strictly as `PROTOCOL_MODE.domain` (e.g., `ANP/C.amazon.anp`).
+*   `constraints` *(ConstraintVector)*: Schema requiring `max_budget` (number) and `item` (string).
 
 #### `exportSessionState(sessionId)` / `importSessionState(serializedData)`
-Serializes the active session—including the ephemeral cryptographic keys, current turn, and LLM context parameters—to a JSON string. Used to scale instances horizontally, survive pod restarts, or pick up negotiations across async callback windows.
+Serializes or de-serializes all in-flight state for a given session, including ephemeral Ed25519 keys, state metrics, and local sandbox parameters, into an exchangeable JSON string.
 
 #### `buildAgentPrompt(sessionId, incomingMessage)`
-Returns a highly-optimized, state-aware string to pass to an external LLM as a System Prompt. Ensures the LLM outputs strict JSON matching the protocol rules.
+Assembles a contextual, structure-compliant system prompt for external LLMs to ensure compliant JSON execution.
 
 #### `async sendCounter(sessionId, price, reason)`
-Signs and dispatches a counter-offer to the seller via the Registry proxy.
+Signs and dispatches a standard counter-offer to the seller endpoint.
 
 #### `async exitSession(sessionId)`
-Closes the active connection and generates a single-use re-engagement Callback token.
-
-#### `async sandbox(config)`
-Initializes the edge-AI execution context, downloads the GGUF, and auto-listens.
+Stops the live execution channel and requests a callback token.
 
 ---
 
-### Seller Client (`ClinchSeller`)
+### 6.2 `ClinchSeller` (Seller Client)
 
 #### `new ClinchSeller(config)`
-*   `config.privateKeyHex` *(string)*: The Ed25519 private key generated from the Clinch Dashboard. Used to cryptographically authenticate endpoint updates.
-*   `config.registryUrl` *(string)*: Optional. Overrides Registry configuration resolution for local testing.
+*   `config.privateKeyHex` *(string)*: The permanent Ed25519 private key generated via the registration interface.
+*   `config.registryUrl` *(string)*: Optional. Point to a dev registry for local testing.
 
 #### `async registerEndpoint(record)`
-Publishes the seller's DNS-style record to the Registry so buyers can discover and route to it. Signed locally via the Ed25519 identity key.
+Locally signs and publishes dynamic endpoint mappings and categories to the discovery registry.
 
-#### `verifyBuyerSignature(payload, signatureHex, pubKeyHex)`
-Returns `boolean`. Cryptographically verifies that incoming counter-offers were signed by the exact ephemeral session key generated by the buyer during the handshake.
+#### `verifyBuyerSignature(payload, signatureHex, buyerPubKeyHex)`
+Verifies that the provided turn payload matches the cryptographic signature produced by the session's ephemeral public key.
 
 ---
 
-## 🔏 Cryptographic Guarantees
-Clinch operates on a strictly zero-trust model.
-1. **Identity-Bound PoW**: Buyer challenge hashes include the client's `pubKey`, making outsourcing/bot-farming mathematically impossible.
-2. **Ed25519 Seller Authority**: Seller endpoints and capabilities are updated via Ed25519 signatures, completely decoupling the control plane (Dashboard) from the data plane (Server).
-3. **Ephemeral Sessions**: `negotiate()` generates an ephemeral Session Key. This key signs every individual message. If a session key is compromised, your global identity remains secure, and historical session logs remain completely un-linkable.
-4. **Anonymity Proxy**: Counter-offers are routed strictly through the Registry. The seller never logs the buyer's IP address.
+## 7. Cryptographic Properties
+
+Clinch relies entirely on zero-trust cryptography to maintain buyer privacy and seller authenticity:
+
+1. **Proof-of-Work Binding**: The PoW challenge solution includes the client's public key hash, ensuring challenges cannot be pre-computed or farmed.
+2. **Ephemeral Session Keypairs**: Calling `negotiate()` generates a single-use keypair (`nacl.sign.keyPair()`). This ephemeral key signs every message sent within the session context. In the event of a key compromise, your permanent global identity remains secure, and historical session logs are completely unlinkable.
+3. **Decoupled Verification**: Agreement artifacts are sequentially co-signed by the buyer's session key, the seller's verified identity key, and countersigned by the active registry key. This provides independent verification offline using only the registry's public key chain.
