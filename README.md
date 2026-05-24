@@ -40,7 +40,7 @@ npm install node-llama-cpp
 
 ### Core Statuses (`CoreStatus`)
 *   `OFFLINE`: Client is disconnected.
-*   `CONNECTING`: Resolving registry DNS and performing Proof-of-Work auth.
+*   `CONNECTING`: Resolving registry configuration and performing Proof-of-Work auth.
 *   `IDLE`: Connected and authenticated. Waiting for handshakes or callbacks.
 *   `RECONNECTING`: Socket connection lost; executing exponential backoff.
 *   `NEGOTIATING`: Active turn-based negotiation sequence in progress.
@@ -86,6 +86,7 @@ async function startLocalAgent() {
     await core.sandbox({ downloadLLM: true });
 
     // 2. Initiate Negotiation: Session automatically transitions to 'NEGOTIATING'
+    // Format: PROTOCOL_MODE.domain.anp (e.g., ANP/C.amazon.anp)
     const sessionId = await core.negotiate('ANP/C.amazon.anp', {
         intent: 'purchase',
         category: 'electronics',
@@ -147,6 +148,7 @@ webhookCore.on('callback_received', async (event) => {
         console.log("Deal reached!");
     } else {
         await webhookCore.sendCounter(event.sessionId, aiDecision.price, aiDecision.message);
+        // Reserialize and update DB after turn to maintain state sync
         await db.update(event.sessionId, webhookCore.exportSessionState(event.sessionId));
     }
 });
@@ -168,7 +170,10 @@ const app = express();
 app.use(express.json());
 
 // Initialize with your permanent Dashboard-generated Private Key
-const seller = new ClinchSeller({ privateKeyHex: process.env.SELLER_PRIVATE_KEY });
+const seller = new ClinchSeller({ 
+    privateKeyHex: process.env.SELLER_PRIVATE_KEY 
+    // registryUrl: 'http://localhost:7860' // Optional: Override for local dev
+});
 
 // Publish your routing endpoint to the network on boot
 await seller.registerEndpoint({
@@ -206,19 +211,20 @@ app.listen(8080);
 ### Buyer Client (`ClinchCore`)
 
 #### `new ClinchCore(config)`
-*   `config.registryUrl` *(string)*: Override Firebase dynamic routing.
+*   `config.registryUrl` *(string)*: Override default dynamic configuration resolution for local testing.
 *   `config.timeoutMs` *(number)*: Connection timeout limit (Default: `5000`ms).
 
 #### `async initialize(cachedToken?)`
-Authenticates the node, completes Identity-Bound PoW, and connects the WebSocket.
+Authenticates the node on the network, completes Identity-Bound PoW, and connects the WebSocket.
+*   `cachedToken` *(string)*: Optional. Re-use an existing network token to bypass PoW calculations on restart.
 
 #### `async negotiate(address, constraints)`
 Launches a cryptographic session handshake. Returns `sessionId`.
-*   `address` *(string)*: e.g. `ANP/C.cloudflare.anp`. (Must include mode prefix).
-*   `constraints` *(ConstraintVector)*: Must include `max_budget` (number).
+*   `address` *(string)*: Target seller address. Must include the protocol mode prefix (e.g., `ANP/C.amazon.anp`).
+*   `constraints` *(ConstraintVector)*: Must include `max_budget` (number) and `item` (string).
 
 #### `exportSessionState(sessionId)` / `importSessionState(serializedData)`
-Serializes the active session—including the ephemeral cryptographic keys, current turn, and LLM context parameters—to a JSON string. Used to scale instances horizontally or survive pod restarts.
+Serializes the active session—including the ephemeral cryptographic keys, current turn, and LLM context parameters—to a JSON string. Used to scale instances horizontally, survive pod restarts, or pick up negotiations across async callback windows.
 
 #### `buildAgentPrompt(sessionId, incomingMessage)`
 Returns a highly-optimized, state-aware string to pass to an external LLM as a System Prompt. Ensures the LLM outputs strict JSON matching the protocol rules.
@@ -232,10 +238,13 @@ Closes the active connection and generates a single-use re-engagement Callback t
 #### `async sandbox(config)`
 Initializes the edge-AI execution context, downloads the GGUF, and auto-listens.
 
+---
+
 ### Seller Client (`ClinchSeller`)
 
 #### `new ClinchSeller(config)`
 *   `config.privateKeyHex` *(string)*: The Ed25519 private key generated from the Clinch Dashboard. Used to cryptographically authenticate endpoint updates.
+*   `config.registryUrl` *(string)*: Optional. Overrides Registry configuration resolution for local testing.
 
 #### `async registerEndpoint(record)`
 Publishes the seller's DNS-style record to the Registry so buyers can discover and route to it. Signed locally via the Ed25519 identity key.
@@ -251,3 +260,4 @@ Clinch operates on a strictly zero-trust model.
 2. **Ed25519 Seller Authority**: Seller endpoints and capabilities are updated via Ed25519 signatures, completely decoupling the control plane (Dashboard) from the data plane (Server).
 3. **Ephemeral Sessions**: `negotiate()` generates an ephemeral Session Key. This key signs every individual message. If a session key is compromised, your global identity remains secure, and historical session logs remain completely un-linkable.
 4. **Anonymity Proxy**: Counter-offers are routed strictly through the Registry. The seller never logs the buyer's IP address.
+```
