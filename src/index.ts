@@ -13,18 +13,22 @@ function toHex(arr: Uint8Array | number[]): string {
     return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+function fromHex(hex: string): Uint8Array {
+    return new Uint8Array(hex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
+}
+
 // ============================================================================
 // TYPES & INTERFACES
 // ============================================================================
 export type CoreStatus =
     | 'OFFLINE'
     | 'CONNECTING'
-    | 'IDLE'            
+    | 'IDLE'
     | 'RECONNECTING'
     | 'ERROR'
-    | 'NEGOTIATING'     
-    | 'CONVERGED'       
-    | 'STALEMATE';      
+    | 'NEGOTIATING'
+    | 'CONVERGED'
+    | 'STALEMATE';
 
 export interface ParsedAddress {
     mode: string;
@@ -51,6 +55,14 @@ export interface SessionState {
     status: 'ACTIVE' | 'EXITED' | 'CLOSED';
     exitTokenHash?: string;
     constraints: ConstraintVector;
+    
+    // Isolated State Tracking (Crucial for concurrency)
+    currentTurn: number;
+    lastKnownPrice: number;
+
+    // Local LLM Context Tracking
+    sandboxSequence?: any; 
+    sandboxSession?: any;
 }
 
 export interface SandboxConfig {
@@ -83,16 +95,10 @@ export class ClinchCore extends EventEmitter {
     private activeSessions = new Map<string, SessionState>();
     private ws: WebSocket | null = null;
 
-    // Sandbox Engine
+    // Sandbox Engine Base (Model/Context are global, Sequences are per-session)
     private isSandboxMode = false;
-    private sandboxContext: any = null;
-    private sandboxSequence: any = null;
-    private sandboxSession: any = null;
+    private sandboxModelContext: any = null;
     private sandboxMaxTurns = 6;
-
-    public currentTurn = 0;
-    public lastKnownPrice = 0;
-    public activeNegotiationId: string | null = null;
 
     constructor(config: ClinchConfig = {}) {
         super();
@@ -114,7 +120,6 @@ export class ClinchCore extends EventEmitter {
 
             if (this.status === 'IDLE') this.emit('log', `🟢 [State] ONLINE & IDLE`);
             else if (this.status === 'ERROR') this.emit('log', `🔴 [State] ERROR`);
-            else if (this.status === 'NEGOTIATING') this.emit('log', `⚡ [State] NEGOTIATING (Turn ${this.currentTurn})`);
             else this.emit('log', `🟡 [State] ${this.status}`);
         }
     }
@@ -257,17 +262,58 @@ export class ClinchCore extends EventEmitter {
     }
 
     // --------------------------------------------------------------------------
+    // SESSION STATE MANAGEMENT (For Enterprise Horizontal Scaling & Reconnects)
+    // --------------------------------------------------------------------------
+    public exportSessionState(sessionId: string): string {
+        const session = this.activeSessions.get(sessionId);
+        if (!session) throw new Error("Session not found");
+
+        const exportable = {
+            sessionId: session.sessionId,
+            sellerId: session.sellerId,
+            status: session.status,
+            exitTokenHash: session.exitTokenHash,
+            constraints: session.constraints,
+            currentTurn: session.currentTurn,
+            lastKnownPrice: session.lastKnownPrice,
+            ephemeralSecretKeyHex: toHex(session.keyPair.secretKey)
+        };
+
+        return JSON.stringify(exportable);
+    }
+
+    public importSessionState(serializedData: string): void {
+        const data = JSON.parse(serializedData);
+        
+        const secretKey = fromHex(data.ephemeralSecretKeyHex);
+        const keyPair = nacl.sign.keyPair.fromSecretKey(secretKey);
+
+        this.activeSessions.set(data.sessionId, {
+            sessionId: data.sessionId,
+            sellerId: data.sellerId,
+            status: data.status,
+            exitTokenHash: data.exitTokenHash,
+            constraints: data.constraints,
+            currentTurn: data.currentTurn,
+            lastKnownPrice: data.lastKnownPrice,
+            keyPair: keyPair
+        });
+
+        this.emit('log', `[State] Rehydrated session ${data.sessionId} pointing at ${data.sellerId}`);
+    }
+
+    public getSession(sessionId: string): SessionState | undefined {
+        return this.activeSessions.get(sessionId);
+    }
+
+    // --------------------------------------------------------------------------
     // UNIVERSAL PROMPT BUILDER
     // --------------------------------------------------------------------------
-    /**
-     * Generates a universally formatted System Prompt for external LLMs (Claude, OpenAI, Gemini).
-     * Developers can pass this string directly to their AI to ensure protocol-compliant negotiation.
-     */
     public buildAgentPrompt(sessionId: string, incomingMessage: string): string {
         const session = this.activeSessions.get(sessionId);
         if (!session) throw new Error("Cannot build prompt: Session not found.");
 
-        const gap = this.lastKnownPrice - session.constraints.max_budget;
+        const gap = session.lastKnownPrice - session.constraints.max_budget;
         const gapText = gap > 0 ? `-$${gap} (Over budget)` : `+$${Math.abs(gap)} (Under budget)`;
 
         return `You are a professional AI purchasing agent negotiating via the Clinch Protocol.
@@ -277,8 +323,8 @@ NEGOTIATION STATE:
 - Item: ${session.constraints.item}
 - Category: ${session.constraints.category || 'General'}
 - Your absolute max budget: $${session.constraints.max_budget}
-- Current turn: ${this.currentTurn}
-- Last seller price: $${this.lastKnownPrice}
+- Current turn: ${session.currentTurn}
+- Last seller price: $${session.lastKnownPrice}
 - Gap to budget: ${gapText}
 
 SELLER'S LATEST MESSAGE:
@@ -337,12 +383,13 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
             sellerId: parsed.domain,
             keyPair: ephemeralKeys,
             status: 'ACTIVE',
-            constraints
+            constraints,
+            currentTurn: 1,
+            lastKnownPrice: 0
         });
 
-        this.activeNegotiationId = response.session_id;
-        this.currentTurn = 1;
         this.setStatus('NEGOTIATING');
+        this.emit('session_started', { sessionId: response.session_id, sellerId: parsed.domain });
         return response.session_id;
     }
 
@@ -350,17 +397,24 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         const session = this.activeSessions.get(sessionId);
         if (!session) throw new Error("Active session not found");
 
-        const payload = { session_id: sessionId, turn: this.currentTurn, price, reason };
+        const payload = { session_id: sessionId, turn: session.currentTurn, price, reason };
         const buyer_sig = toHex(nacl.sign.detached(
             new TextEncoder().encode(JSON.stringify(payload)),
             session.keyPair.secretKey
         ));
 
-        await this.networkRequest(`/api/route/${session.sellerId}/counter`, {
+        const response = await this.networkRequest(`/api/route/${session.sellerId}/counter`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ...payload, buyer_sig })
         });
+
+        // Sync state if deal reached
+        if (response.msg_type === 'accept' || response.status === 'COMMITTED') {
+            session.status = 'CLOSED';
+            session.lastKnownPrice = response.price || price;
+            this.emit('session_closed', { sessionId, outcome: 'deal', finalPrice: session.lastKnownPrice });
+        }
     }
 
     async exitSession(sessionId: string): Promise<string> {
@@ -396,6 +450,8 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
     }
 
     private async setupSandbox(config: SandboxConfig = {}): Promise<void> {
+        if (this.sandboxModelContext) return; // Already initialized
+
         const settings = {
             downloadLLM: true,
             modelUrl: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
@@ -403,7 +459,6 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
             ...config
         };
 
-        // DYNAMIC IMPORTS: Won't break Webpack/Metro unless sandbox() is actually called!
         let nodeLlama;
         try { nodeLlama = await import('node-llama-cpp'); }
         catch (e) { throw new Error("Sandbox requires 'node-llama-cpp'. Run: npm install node-llama-cpp"); }
@@ -419,8 +474,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
             this.emit('log', `[Sandbox] Downloading Qwen 1.5B Q4_K_M (1.1GB)...`);
             const { pipeline } = await import('stream/promises');
             const { Readable } = await import('stream');
-            
-            // @ts-ignore
+
             const response = await fetch(settings.modelUrl);
             if (!response.ok) throw new Error("Fetch failed: " + response.statusText);
 
@@ -432,7 +486,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         const llama = await nodeLlama.getLlama();
         const model = await llama.loadModel({ modelPath: resolvedPath });
 
-        this.sandboxContext = await model.createContext({
+        this.sandboxModelContext = await model.createContext({
             contextSize: 2048,
             threads: Math.min(4, Math.max(1, os.cpus().length - 1)),
             batchSize: 512
@@ -441,34 +495,44 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 
     private async handleAutomaticSandboxTurn(sessionId: string, payload: any) {
         const session = this.activeSessions.get(sessionId);
-        if (!session) return;
+        if (!session || session.status !== 'ACTIVE') return;
 
-        this.currentTurn++;
+        session.currentTurn++;
         this.setStatus('NEGOTIATING');
+        this.emit('log', `⚡ [Sandbox] Analyzing Turn ${session.currentTurn} for ${sessionId}`);
 
         const incomingPrice = this.extractPrice(payload.message || JSON.stringify(payload), 'Counter');
-        if (incomingPrice !== null) this.lastKnownPrice = incomingPrice;
+        if (incomingPrice !== null) session.lastKnownPrice = incomingPrice;
 
-        if (this.lastKnownPrice <= session.constraints.max_budget) {
-            this.setStatus('CONVERGED');
-            this.activeSessions.delete(sessionId);
+        if (session.lastKnownPrice > 0 && session.lastKnownPrice <= session.constraints.max_budget) {
+            this.emit('log', `🎉 [Sandbox] Seller met budget conditions! Closing deal.`);
+            await this.sendCounter(sessionId, session.lastKnownPrice, "I accept this offer.");
             return;
         }
 
-        if (this.currentTurn > this.sandboxMaxTurns) {
+        if (session.currentTurn > this.sandboxMaxTurns) {
             this.setStatus('STALEMATE');
+            this.emit('log', `🛑 [Sandbox] Max turns reached. Exiting.`);
             await this.exitSession(sessionId);
             return;
         }
 
-        const modelResponse = await this.sandboxEvaluate(session, payload.message || `The price is $${this.lastKnownPrice}`);
-        const parsedOffer = this.extractPrice(modelResponse, 'Offer');
-        const reasonLine = modelResponse.split('\n').find(l => l.startsWith('Reason:'));
-        const reason = reasonLine ? reasonLine.replace('Reason:', '').trim() : "Suggesting a fair counter-offer.";
+        const modelResponse = await this.sandboxEvaluate(session, payload.message || `The price is $${session.lastKnownPrice}`);
+        const parsedOffer = this.extractPrice(modelResponse, 'Offer') || this.extractPrice(modelResponse, 'price');
+        
+        let reason = "Suggesting a fair counter-offer.";
+        try {
+            const parsedJson = JSON.parse(modelResponse.replace(/```json|```/g, "").trim());
+            if (parsedJson.message) reason = parsedJson.message;
+            else if (parsedJson.reason) reason = parsedJson.reason;
+        } catch(e) {}
 
         if (parsedOffer !== null) {
             const finalOffer = Math.min(parsedOffer, session.constraints.max_budget);
             await this.sendCounter(sessionId, finalOffer, reason);
+        } else {
+            this.emit('log', `⚠️ [Sandbox] Failed to parse offer. Generating safe counter.`);
+            await this.sendCounter(sessionId, session.lastKnownPrice * 0.9, "Can you do slightly better?");
         }
     }
 
@@ -477,18 +541,19 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 
         const systemPrompt = this.buildAgentPrompt(session.sessionId, incomingOffer);
 
-        if (this.sandboxSequence) this.sandboxSequence.dispose();
-        this.sandboxSequence = this.sandboxContext.getSequence();
-
-        this.sandboxSession = new LlamaChatSession({
-            contextSequence: this.sandboxSequence,
-            systemPrompt: systemPrompt,
-            chatWrapper: new ChatMLChatWrapper()
-        });
+        // State Isolation: Bind sequence to the session, not the global class!
+        if (!session.sandboxSequence) {
+            session.sandboxSequence = this.sandboxModelContext.getSequence();
+            session.sandboxSession = new LlamaChatSession({
+                contextSequence: session.sandboxSequence,
+                systemPrompt: systemPrompt,
+                chatWrapper: new ChatMLChatWrapper()
+            });
+        }
 
         let responseText = "";
-        await this.sandboxSession.prompt(incomingOffer, {
-            maxTokens: 80,
+        await session.sandboxSession.prompt(incomingOffer, {
+            maxTokens: 120,
             onTextChunk: (chunk: string) => { responseText += chunk; }
         });
 
@@ -502,16 +567,22 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         const regex = new RegExp(`${prefix}\\s*\\:?\\s*\\$?(\\d+(?:\\.\\d{2})?)`, 'i');
         const match = text.match(regex);
         if (match) return parseFloat(match[1]);
-        
+
         const fallbackRegex = /"price"\s*:\s*(\d+(?:\.\d{2})?)/i;
         const fallbackMatch = text.match(fallbackRegex);
         return fallbackMatch ? parseFloat(fallbackMatch[1]) : null;
     }
 
     public parseAddress(address: string): ParsedAddress {
-        const parts = address.split('.');
-        if (parts.length < 2) throw new Error("Invalid Address Format");
-        return { mode: parts[0], domain: parts.slice(1).join('.').toLowerCase(), route: '/' };
+        if (!address.includes('.')) throw new Error("Invalid Address Format. Expected MODE.domain (e.g. ANP/A.amazon.anp)");
+        
+        const firstDotIdx = address.indexOf('.');
+        const mode = address.substring(0, firstDotIdx);
+        const domain = address.substring(firstDotIdx + 1).toLowerCase();
+        
+        if (!mode.startsWith("ANP/")) throw new Error(`Invalid protocol mode '${mode}'. Must start with 'ANP/'`);
+
+        return { mode, domain, route: '/' };
     }
 
     private async solvePoW(nonce: string, difficultyBits: number): Promise<string> {
@@ -535,78 +606,5 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
             else { zeroBits += Math.clz32(byte) - 24; break; }
         }
         return zeroBits >= bits;
-    }
-}
-
-// ============================================================================
-// THE CLINCH SELLER LIBRARY (Server-Side)
-// ============================================================================
-export interface SellerRecord {
-    agent_id: string;
-    display_name: string;
-    endpoint: string;
-    supported_modes: string[];
-    categories: string[];
-    capabilities: string[];
-}
-
-export class ClinchSeller extends EventEmitter {
-    private config: ClinchConfig;
-    private cachedRegistryUrl: string | null = null;
-    public sellerAuthToken: string | null = null;
-    private identityPrivKey: Uint8Array;
-    public identityPubKey: string;
-
-    constructor(config: ClinchConfig = {}) {
-        super();
-        this.config = { timeoutMs: 5000, ...config };
-        const keyPair = nacl.sign.keyPair();
-        this.identityPrivKey = keyPair.secretKey;
-        this.identityPubKey = toHex(keyPair.publicKey);
-        if (this.config.registryUrl) this.cachedRegistryUrl = this.config.registryUrl;
-    }
-
-    async authenticate(authToken: string): Promise<void> {
-        this.sellerAuthToken = authToken;
-        if (!this.cachedRegistryUrl) {
-            const res = await fetch(FIREBASE_CONFIG_URL);
-            const config = JSON.parse(await res.text());
-            this.cachedRegistryUrl = config.registry_nodes[PROTOCOL_VERSION];
-        }
-    }
-
-    async registerEndpoint(record: SellerRecord): Promise<any> {
-        if (!this.sellerAuthToken) throw new Error("Must call authenticate() first.");
-        const payload = {
-            ...record,
-            public_key: this.identityPubKey,
-            record_sig: this.signData(record)
-        };
-        const res = await fetch(`${this.cachedRegistryUrl}/api/dashboard/sellers/register`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${this.sellerAuthToken}`
-            },
-            body: JSON.stringify(payload)
-        });
-        if (!res.ok) throw new Error(`Registration failed: ${await res.text()}`);
-        return await res.json();
-    }
-
-    verifyBuyerSignature(payload: any, signatureHex: string, buyerSessionPubKeyHex: string): boolean {
-        try {
-            const msgUint8 = new TextEncoder().encode(JSON.stringify(payload));
-            const sigUint8 = new Uint8Array(signatureHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-            const pubKeyUint8 = new Uint8Array(buyerSessionPubKeyHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-            return nacl.sign.detached.verify(msgUint8, sigUint8, pubKeyUint8);
-        } catch (e) {
-            return false;
-        }
-    }
-
-    private signData(data: any): string {
-        const msgUint8 = new TextEncoder().encode(JSON.stringify(data));
-        return toHex(nacl.sign.detached(msgUint8, this.identityPrivKey));
     }
 }
