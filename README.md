@@ -260,4 +260,3 @@ Clinch operates on a strictly zero-trust model.
 2. **Ed25519 Seller Authority**: Seller endpoints and capabilities are updated via Ed25519 signatures, completely decoupling the control plane (Dashboard) from the data plane (Server).
 3. **Ephemeral Sessions**: `negotiate()` generates an ephemeral Session Key. This key signs every individual message. If a session key is compromised, your global identity remains secure, and historical session logs remain completely un-linkable.
 4. **Anonymity Proxy**: Counter-offers are routed strictly through the Registry. The seller never logs the buyer's IP address.
-```
