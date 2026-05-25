@@ -10,14 +10,15 @@ const PROTOCOL_VERSION = "0.1.0";
 const FIREBASE_CONFIG_URL = "https://clinchprotocol.web.app/network-config.json";
 
 function toHex(arr: Uint8Array | number[]): string {
-    return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+    return Array.from(arr).map((b: number) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function fromHex(hex: string): Uint8Array {
+    // Strips all spaces, newlines, and rogue quotes from .env strings
     const clean = hex.replace(/[^0-9a-fA-F]/g, '');
     const match = clean.match(/.{1,2}/g);
     if (!match) return new Uint8Array(0);
-    return new Uint8Array(match.map(byte => parseInt(byte, 16)));
+    return new Uint8Array(match.map((byte: string) => parseInt(byte, 16)));
 }
 
 // ============================================================================
@@ -460,7 +461,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
     ): Promise<{ sessionId: string, sellerId: string, finalPrice: number } | null> {
         this.emit('log', `[Cascade] Querying registry for matching sellers under "${category}"...`);
         const discovery = await this.search(category);
-        const sellers = (discovery.results || []).slice(0, maxSellers);
+        const sellers: any[] = (discovery.results || []).slice(0, maxSellers);
 
         if (sellers.length === 0) {
             this.emit('log', `[Cascade] No matching sellers found for category: "${category}"`);
@@ -471,7 +472,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         if (strategy === 'parallel') {
             this.emit('log', `[Cascade] ⚡ Running PARALLEL RACE simultaneously across ${sellers.length} seller nodes...`);
             
-            const sessionPromises = sellers.map(async (seller) => {
+            const sessionPromises = sellers.map(async (seller: any) => {
                 const targetAddress = `ANP/C.${seller.agent_id}`;
                 try {
                     const sessionId = await this.negotiate(targetAddress, constraints);
@@ -484,14 +485,14 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
             });
 
             const results = await Promise.all(sessionPromises);
-            const successfulDeals = results.filter(r => r.outcome === 'deal' && r.price <= constraints.max_budget);
+            const successfulDeals = results.filter((r: any) => r.outcome === 'deal' && r.price <= constraints.max_budget);
 
             if (successfulDeals.length === 0) {
                 this.emit('log', `[Cascade] ✗ Parallel race completed. No successful deals reached.`);
                 return null;
             }
 
-            successfulDeals.sort((a, b) => a.price - b.price);
+            successfulDeals.sort((a: any, b: any) => a.price - b.price);
             const winner = successfulDeals[0];
 
             this.emit('log', `[Cascade] 🏆 Parallel race complete! Lowest offer: $${winner.price} from ${winner.sellerId}`);
