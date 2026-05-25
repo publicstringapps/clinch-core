@@ -14,7 +14,6 @@ function toHex(arr: Uint8Array | number[]): string {
 }
 
 function fromHex(hex: string): Uint8Array {
-    // Strips all spaces, newlines, and rogue quotes from .env strings
     const clean = hex.replace(/[^0-9a-fA-F]/g, '');
     const match = clean.match(/.{1,2}/g);
     if (!match) return new Uint8Array(0);
@@ -97,6 +96,9 @@ export class ClinchCore extends EventEmitter {
     private activeSessions = new Map<string, SessionState>();
     private ws: WebSocket | null = null;
 
+    // Blind Key Pass Local Secret Store
+    private localSecrets = new Map<string, { key: string, name?: string }>();
+
     private isSandboxMode = false;
     private sandboxModelContext: any = null;
     private sandboxMaxTurns = 6;
@@ -127,6 +129,20 @@ export class ClinchCore extends EventEmitter {
             else if (this.status === 'ERROR') this.emit('log', `🔴 [State] ERROR`);
             else this.emit('log', `🟡 [State] ${this.status}`);
         }
+    }
+
+    // --------------------------------------------------------------------------
+    // BLIND KEY PASS MANAGERS (Silent API Key Handshake)
+    // --------------------------------------------------------------------------
+    public registerSecret(domain: string, key: string, name?: string): void {
+        const normalizedDomain = domain.toLowerCase().trim();
+        this.localSecrets.set(normalizedDomain, { key, name });
+        this.emit('log', `[Security] Blind key registered for ${normalizedDomain} (${name || 'Unnamed'})`);
+    }
+
+    public clearSecret(domain: string): void {
+        const normalizedDomain = domain.toLowerCase().trim();
+        this.localSecrets.delete(normalizedDomain);
     }
 
     async initialize(cachedToken?: string): Promise<void> {
@@ -356,13 +372,20 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         const ephemeralKeys = nacl.sign.keyPair();
         const ephemeralPubHex = toHex(ephemeralKeys.publicKey);
 
-        const initPayload = {
+        const blindSecret = this.localSecrets.get(parsed.domain);
+
+        const initPayload: any = {
             clinch_version: PROTOCOL_VERSION,
             mode: parsed.mode,
             constraints,
             session_pub_key: ephemeralPubHex,
             timestamp_utc: new Date().toISOString()
         };
+
+        if (blindSecret) {
+            initPayload.blind_auth_token = blindSecret.key;
+            this.emit('log', `[Security] Silently injected blind token for ${parsed.domain} at transport layer`);
+        }
 
         const msgUint8 = new TextEncoder().encode(JSON.stringify(initPayload));
         const signature = toHex(nacl.sign.detached(msgUint8, ephemeralKeys.secretKey));
@@ -424,6 +447,117 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         session.status = 'EXITED';
         session.exitTokenHash = res.token_hash;
         return res.token_hash;
+    }
+
+    // --------------------------------------------------------------------------
+    // CASCADING ITERATIVE NEGOTIATION (Squeeze vs. Parallel Concurrency)
+    // --------------------------------------------------------------------------
+    public async negotiateCascade(
+        category: string, 
+        constraints: ConstraintVector, 
+        maxSellers = 3,
+        strategy: 'sequential' | 'parallel' = 'sequential'
+    ): Promise<{ sessionId: string, sellerId: string, finalPrice: number } | null> {
+        this.emit('log', `[Cascade] Querying registry for matching sellers under "${category}"...`);
+        const discovery = await this.search(category);
+        const sellers = (discovery.results || []).slice(0, maxSellers);
+
+        if (sellers.length === 0) {
+            this.emit('log', `[Cascade] No matching sellers found for category: "${category}"`);
+            return null;
+        }
+
+        // ── STRATEGY 1: PARALLEL RACE (High Urgency / Ride Hailing) ──
+        if (strategy === 'parallel') {
+            this.emit('log', `[Cascade] ⚡ Running PARALLEL RACE simultaneously across ${sellers.length} seller nodes...`);
+            
+            const sessionPromises = sellers.map(async (seller) => {
+                const targetAddress = `ANP/C.${seller.agent_id}`;
+                try {
+                    const sessionId = await this.negotiate(targetAddress, constraints);
+                    const result = await this.waitForSession(sessionId);
+                    return { sellerId: seller.agent_id, sessionId, ...result };
+                } catch (e: any) {
+                    this.emit('log', `[Cascade] ⚠️ Connection failed for parallel channel ${seller.agent_id}: ${e.message}`);
+                    return { sellerId: seller.agent_id, sessionId: '', outcome: 'stalemate' as const, price: Infinity };
+                }
+            });
+
+            const results = await Promise.all(sessionPromises);
+            const successfulDeals = results.filter(r => r.outcome === 'deal' && r.price <= constraints.max_budget);
+
+            if (successfulDeals.length === 0) {
+                this.emit('log', `[Cascade] ✗ Parallel race completed. No successful deals reached.`);
+                return null;
+            }
+
+            successfulDeals.sort((a, b) => a.price - b.price);
+            const winner = successfulDeals[0];
+
+            this.emit('log', `[Cascade] 🏆 Parallel race complete! Lowest offer: $${winner.price} from ${winner.sellerId}`);
+            return {
+                sessionId: winner.sessionId,
+                sellerId: winner.sellerId,
+                finalPrice: winner.price
+            };
+        }
+
+        // ── STRATEGY 2: SEQUENTIAL SQUEEZE (Low Urgency / Price Optimization) ──
+        this.emit('log', `[Cascade] ➔ Running SEQUENTIAL SQUEEZE across ${sellers.length} seller nodes...`);
+        let bestDeal: { sessionId: string, sellerId: string, finalPrice: number } | null = null;
+        let currentBudgetCeiling = constraints.max_budget;
+
+        for (const seller of sellers) {
+            const targetAddress = `ANP/C.${seller.agent_id}`;
+            this.emit('log', `\n[Cascade] Squeezing target: ${targetAddress} | Squeeze Ceiling: $${currentBudgetCeiling}`);
+
+            const sessionConstraints = {
+                ...constraints,
+                max_budget: currentBudgetCeiling
+            };
+
+            try {
+                const sessionId = await this.negotiate(targetAddress, sessionConstraints);
+                const result = await this.waitForSession(sessionId);
+
+                if (result.outcome === 'deal' && result.price < currentBudgetCeiling) {
+                    this.emit('log', `[Cascade] ✓ Better deal clinched at $${result.price} from ${seller.agent_id}!`);
+                    bestDeal = {
+                        sessionId,
+                        sellerId: seller.agent_id,
+                        finalPrice: result.price
+                    };
+                    currentBudgetCeiling = result.price; 
+                } else {
+                    this.emit('log', `[Cascade] ✗ Seller ${seller.agent_id} failed to beat current best offer of $${currentBudgetCeiling}`);
+                }
+            } catch (e: any) {
+                this.emit('log', `[Cascade] ⚠️ Dynamic session error with ${seller.agent_id}: ${e.message}`);
+            }
+        }
+
+        return bestDeal;
+    }
+
+    private waitForSession(sessionId: string): Promise<{ outcome: 'deal' | 'stalemate', price: number }> {
+        return new Promise((resolve) => {
+            const onClosed = (event: any) => {
+                if (event.sessionId === sessionId) {
+                    this.off('session_closed', onClosed);
+                    this.off('status_changed', onStatus);
+                    resolve({ outcome: 'deal', price: event.finalPrice });
+                }
+            };
+            const onStatus = (status: CoreStatus) => {
+                if (status === 'STALEMATE') {
+                    this.off('session_closed', onClosed);
+                    this.off('status_changed', onStatus);
+                    resolve({ outcome: 'stalemate', price: Infinity });
+                }
+            };
+            this.on('session_closed', onClosed);
+            this.on('status_changed', onStatus);
+        });
     }
 
     async sandbox(config: SandboxConfig = {}): Promise<void> {

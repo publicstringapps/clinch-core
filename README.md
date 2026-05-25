@@ -11,7 +11,7 @@
 The Agent Negotiation Protocol (ANP) governs how two autonomous software agents establish identity, declare capabilities, and reach a cryptographically verifiable agreement on price and terms.
 
 ### 1.1 Address Formatting & Routing
-All destination routing in Clinch relies on strict, structured addressing:
+All destination routing in Clinch relies on structured, prefixed addresses:
 
 $$\text{PROTOCOL\_MODE} \mathbin{.} \text{domain} \mathbin{.} \text{TLD}$$
 
@@ -36,9 +36,10 @@ The SDK maintains an isolated, turn-based state machine for each active session.
 *   `OFFLINE`: Client is completely disconnected.
 *   `CONNECTING`: Authenticating identity and performing local Proof-of-Work (PoW) verification.
 *   `IDLE`: Connected and authenticated. Ready to initialize new sessions.
+*   `RECONNECTING`: Socket connection lost; executing exponential backoff.
 *   `NEGOTIATING`: Active, turn-based bargaining sequence in progress.
 *   `CONVERGED`: Mathematical convergence reached; agreement co-signed.
-*   `STALEMATE`: Handshake or negotiation sequence aborted or timed out.
+*   `STALEMATE`: Negotiation terminated; max turns reached without convergence.
 *   `ERROR`: Internal network, compilation, or cryptographic validation failure.
 
 ### Developer Event Subscriptions
@@ -114,7 +115,7 @@ async function runAutonomousSession() {
 runAutonomousSession();
 ```
 
-### 4.2 Cloud Webhook & Horizontal Scale Pattern
+### 4.2 Webhook & Horizontal Scale Pattern
 For enterprise cloud environments where processes must remain stateless or scale horizontally across server pods, you must serialize and rehydrate active sessions dynamically. This ensures that when an asynchronous callback arrives, any pod can load the session state and use the matching ephemeral key to sign the next turn.
 
 ```javascript
@@ -167,11 +168,51 @@ webhookCore.on('callback_received', async (event) => {
 });
 ```
 
+### 4.3 Cascading Multi-Seller Squeeze and Races
+To implement market discovery, the SDK supports cascading negotiations across multiple matching sellers. The Core orchestrates two distinct optimization strategies:
+
+#### Sequential Squeeze (Default)
+Useful for high-value items where time is secondary to price. The SDK negotiates sequentially with each seller, using the converged deal price of the previous seller as the strict, maximum budget ceiling for the next. This dynamically forces sellers to underbid one another.
+
+#### Parallel Race
+Necessary for real-time services like ride-hailing or logistics. The SDK handshakes and conducts negotiations with all selected sellers concurrently in parallel. Once all sessions finish, it selects the absolute lowest price converged under your budget.
+
+```javascript
+// Triggers the cascading loop
+const bestDeal = await core.negotiateCascade(
+    'domain_name',          // Category to discover
+    { intent: 'purchase', item: 'mybrand.io', max_budget: 150.00 },
+    3,                      // Max sellers to target
+    'sequential'            // 'sequential' | 'parallel'
+);
+
+if (bestDeal) {
+    console.log(`🏆 Optimal deal secured with ${bestDeal.sellerId} at $${bestDeal.finalPrice}`);
+}
+```
+
+### 4.4 Blind Key Pass (Credential Injection)
+For sessions with services that require authorization tokens or API keys to operate (such as platform execution nodes), you can register these credentials locally.
+
+The Core library securely stores these secrets and silently injects them into the handshake transport layer during session initialization. This prevents the API keys from ever being exposed to the AI model's context window, safeguarding you against prompt injection attacks.
+
+```javascript
+// Register the API credential locally bound to the domain namespace
+core.registerSecret('apify.anp', 'apify_sec_key_xyz987', 'Apify Production Token');
+
+// Handshaking with this address now automatically injects the credential silently
+const sessionId = await core.negotiate('ANP/C.apify.anp', {
+    intent: 'purchase',
+    item: 'actor-scraper-run',
+    max_budget: 5.00
+});
+```
+
 ---
 
 ## 5. Integration Guide: Seller Nodes
 
-Sellers use the `ClinchSeller` class to build compliant, automated endpoints. 
+Sellers use the `ClinchSeller` class to build compliant, automated endpoints.
 
 ### 5.1 Decoupled Routing Architecture
 To prevent centralized token expiration failures, Clinch separates ownership from routing:
@@ -240,6 +281,13 @@ Initializes the cryptographic handshake with a seller. Returns `sessionId`.
 
 #### `exportSessionState(sessionId)` / `importSessionState(serializedData)`
 Serializes or de-serializes all in-flight state for a given session, including ephemeral Ed25519 keys, state metrics, and local sandbox parameters, into an exchangeable JSON string.
+
+#### `registerSecret(domain, key, name?)` / `clearSecret(domain)`
+Saves or clears an API secret locally. The key is never visible to the AI agent and is silently passed in handshake payloads to the designated domain.
+
+#### `async negotiateCascade(category, constraints, maxSellers?, strategy?)`
+Queries the discovery register and cascade-negotiates with matching nodes.
+*   `strategy`: `'sequential'` (Sequential Squeeze) or `'parallel'` (Concurrent Race). Default: `'sequential'`.
 
 #### `buildAgentPrompt(sessionId, incomingMessage)`
 Assembles a contextual, structure-compliant system prompt for external LLMs to ensure compliant JSON execution.
