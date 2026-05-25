@@ -234,7 +234,7 @@ const seller = new ClinchSeller({
 // 2. Publish endpoint to the registry on boot (Self-Signing)
 await seller.registerEndpoint({
     agent_id: 'amazon.anp',
-    endpoint: 'https://your-seller-api.com/anp/v1',
+    endpoint: 'https://your-seller-api.com', //note, use your base endpoint
     supported_modes: ['ANP/C'],
     categories: ['electronics'],
     capabilities: ['price_flex']
