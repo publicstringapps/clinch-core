@@ -14,6 +14,7 @@ function toHex(arr: Uint8Array | number[]): string {
 }
 
 function fromHex(hex: string): Uint8Array {
+    // Strips all spaces, newlines, and rogue quotes from .env strings
     const clean = hex.replace(/[^0-9a-fA-F]/g, '');
     const match = clean.match(/.{1,2}/g);
     if (!match) return new Uint8Array(0);
@@ -99,6 +100,7 @@ export class ClinchCore extends EventEmitter {
     private activeSessions = new Map<string, SessionState>();
     private ws: WebSocket | null = null;
 
+    // Blind Key Pass Local Secret Store
     private localSecrets = new Map<string, { key: string, name?: string }>();
 
     private isSandboxMode = false;
@@ -133,6 +135,9 @@ export class ClinchCore extends EventEmitter {
         }
     }
 
+    // --------------------------------------------------------------------------
+    // BLIND KEY PASS MANAGERS (Silent API Key Handshake)
+    // --------------------------------------------------------------------------
     public registerSecret(domain: string, key: string, name?: string): void {
         const normalizedDomain = domain.toLowerCase().trim();
         this.localSecrets.set(normalizedDomain, { key, name });
@@ -331,7 +336,6 @@ export class ClinchCore extends EventEmitter {
         const gap = session.lastKnownPrice - session.constraints.max_budget;
         const gapText = gap > 0 ? `-$${gap} (Over budget)` : `+$${Math.abs(gap)} (Under budget)`;
 
-        // Inject dynamic seller/broker directives directly into the prompt stream
         const customInstructionsBlock = session.sellerInstructions
             ? `\nCUSTOM INSTRUCTIONS DIRECT FROM TARGET DOMAIN (${session.sellerId}):\n"""\n${session.sellerInstructions}\n"""\n`
             : "";
@@ -402,7 +406,6 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
             body: JSON.stringify({ ...initPayload, sig: signature })
         });
 
-        // Capture dynamic instructions passed back from the handshake response
         const instructions = response.custom_instructions || null;
 
         this.activeSessions.set(response.session_id, {
@@ -739,12 +742,13 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 // THE CLINCH SELLER LIBRARY (Server-Side)
 // ============================================================================
 export interface SellerRecord {
-  agent_id:        string;
-  endpoint:        string;
-  supported_modes: string[];
-  categories:      string[];
-  capabilities:    string[];
-  display_name?:   string; 
+  agent_id:            string;
+  endpoint:            string;
+  supported_modes:     string[];
+  categories:          string[];
+  capabilities:        string[];
+  display_name?:       string; 
+  custom_instructions?: string; // Strictly typed dynamic record instructions mapping
 }
 
 export class ClinchSeller extends EventEmitter {
