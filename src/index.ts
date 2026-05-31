@@ -59,14 +59,14 @@ export interface SessionState {
     status: 'ACTIVE' | 'EXITED' | 'CLOSED';
     exitTokenHash?: string;
     constraints: ConstraintVector;
-    
+
     currentTurn: number;
     lastKnownPrice: number;
 
     // Direct, dynamic instructions injected by the target domain
     sellerInstructions?: string | null;
 
-    sandboxSequence?: any; 
+    sandboxSequence?: any;
     sandboxSession?: any;
 }
 
@@ -169,7 +169,15 @@ export class ClinchCore extends EventEmitter {
         } catch (error: any) {
             this.setStatus('ERROR');
             this.emit('error', new Error(`Initialization failed: ${error.message}`));
-            setTimeout(() => this.initialize(cachedToken), 5000);
+            
+            // If the error points to an authentication or token failure, retry WITHOUT the cached token
+            // to force a fresh PoW challenge and obtain a valid token.
+            const isAuthError = error.message.toLowerCase().includes("auth") || 
+                                error.message.toLowerCase().includes("token") ||
+                                error.message.toLowerCase().includes("payload");
+            
+            const retryToken = isAuthError ? undefined : cachedToken;
+            setTimeout(() => this.initialize(retryToken), 5000);
         }
     }
 
@@ -235,6 +243,8 @@ export class ClinchCore extends EventEmitter {
             this.emit('log', `[Network] Connecting to WebSocket at ${wsUrl}...`);
 
             this.ws = new WebSocket(wsUrl);
+            
+            // Connection timeout for the TCP handshaking phase
             const connectionTimeout = setTimeout(() => {
                 if (this.ws?.readyState !== WebSocket.OPEN) {
                     this.ws?.close();
@@ -242,33 +252,61 @@ export class ClinchCore extends EventEmitter {
                 }
             }, this.config.timeoutMs);
 
+            // Authentication timeout covering the handshake once connected
+            let authTimeout: NodeJS.Timeout;
+
             this.ws.on('open', () => {
                 clearTimeout(connectionTimeout);
                 this.reconnectAttempts = 0;
                 this.emit('log', '[Network] WebSocket connected. Sending AUTH...');
+                
+                // Set a timeout specifically for waiting on AUTH_SUCCESS or ERROR
+                authTimeout = setTimeout(() => {
+                    if (this.status === 'CONNECTING') {
+                        this.ws?.close();
+                        reject(new Error("WebSocket authentication timed out"));
+                    }
+                }, this.config.timeoutMs);
+
                 this.ws!.send(JSON.stringify({ type: 'AUTH', token: this.jwtToken }));
             });
 
             this.ws.on('message', (data) => {
-                const msg = JSON.parse(data.toString());
-                if (msg.type === 'AUTH_SUCCESS') {
-                    this.setStatus('IDLE');
-                    resolve();
-                }
-                if (msg.type === 'CALLBACK') {
-                    this.emit('log', `🔔 [Network] Received callback for session ${msg.session_id}`);
-                    this.emit('callback_received', { sessionId: msg.session_id, payload: msg.payload });
-                    this.ws!.send(JSON.stringify({ type: 'ACK', id: msg.id }));
+                try {
+                    const msg = JSON.parse(data.toString());
+                    
+                    if (msg.type === 'AUTH_SUCCESS') {
+                        clearTimeout(authTimeout);
+                        this.setStatus('IDLE');
+                        resolve();
+                    }
+                    
+                    if (msg.type === 'ERROR') {
+                        clearTimeout(authTimeout);
+                        this.emit('log', `🔴 [Network] WS Auth Error: ${msg.message}`);
+                        this.ws?.close();
+                        reject(new Error(msg.message || "Unknown authentication error"));
+                    }
+                    
+                    if (msg.type === 'CALLBACK') {
+                        this.emit('log', `🔔 [Network] Received callback for session ${msg.session_id}`);
+                        this.emit('callback_received', { sessionId: msg.session_id, payload: msg.payload });
+                        this.ws!.send(JSON.stringify({ type: 'ACK', id: msg.id }));
+                    }
+                } catch (err: any) {
+                    this.emit('log', `⚠️ [Network] Failed to parse message: ${err.message}`);
                 }
             });
 
             this.ws.on('error', (err: any) => {
                 clearTimeout(connectionTimeout);
+                if (authTimeout) clearTimeout(authTimeout);
                 if (this.status === 'CONNECTING') reject(err);
             });
 
             this.ws.on('close', () => {
                 clearTimeout(connectionTimeout);
+                if (authTimeout) clearTimeout(authTimeout);
                 if (this.status !== 'OFFLINE') this.handleReconnect();
             });
         });
@@ -463,8 +501,8 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
     }
 
     public async negotiateCascade(
-        category: string, 
-        constraints: ConstraintVector, 
+        category: string,
+        constraints: ConstraintVector,
         maxSellers = 3,
         strategy: 'sequential' | 'parallel' = 'sequential'
     ): Promise<{ sessionId: string, sellerId: string, finalPrice: number } | null> {
@@ -479,7 +517,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 
         if (strategy === 'parallel') {
             this.emit('log', `[Cascade] ⚡ Running PARALLEL RACE simultaneously across ${sellers.length} seller nodes...`);
-            
+
             const sessionPromises = sellers.map(async (seller: any) => {
                 const targetAddress = `ANP/C.${seller.agent_id}`;
                 try {
@@ -535,7 +573,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
                         sellerId: seller.agent_id,
                         finalPrice: result.price
                     };
-                    currentBudgetCeiling = result.price; 
+                    currentBudgetCeiling = result.price;
                 } else {
                     this.emit('log', `[Cascade] ✗ Seller ${seller.agent_id} failed to beat current best offer of $${currentBudgetCeiling}`);
                 }
@@ -583,7 +621,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
     }
 
     private async setupSandbox(config: SandboxConfig = {}): Promise<void> {
-        if (this.sandboxModelContext) return; 
+        if (this.sandboxModelContext) return;
 
         const settings = {
             downloadLLM: true,
@@ -652,7 +690,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 
         const modelResponse = await this.sandboxEvaluate(session, payload.message || `The price is $${session.lastKnownPrice}`);
         const parsedOffer = this.extractPrice(modelResponse, 'Offer') || this.extractPrice(modelResponse, 'price');
-        
+
         let reason = "Suggesting a fair counter-offer.";
         try {
             const parsedJson = JSON.parse(modelResponse.replace(/```json|```/g, "").trim());
@@ -704,11 +742,11 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
 
     public parseAddress(address: string): ParsedAddress {
         if (!address.includes('.')) throw new Error("Invalid Address Format. Expected MODE.domain (e.g. ANP/C.amazon.anp)");
-        
+
         const firstDotIdx = address.indexOf('.');
         const mode = address.substring(0, firstDotIdx);
         const domain = address.substring(firstDotIdx + 1).toLowerCase();
-        
+
         if (!mode.startsWith("ANP/")) throw new Error(`Invalid protocol mode '${mode}'. Must start with 'ANP/'`);
 
         return { mode, domain, route: '/' };
@@ -747,7 +785,7 @@ export interface SellerRecord {
   supported_modes:     string[];
   categories:          string[];
   capabilities:        string[];
-  display_name?:       string; 
+  display_name?:       string;
   custom_instructions?: string; // Strictly typed dynamic record instructions mapping
 }
 
