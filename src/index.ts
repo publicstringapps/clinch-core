@@ -14,7 +14,6 @@ function toHex(arr: Uint8Array | number[]): string {
 }
 
 function fromHex(hex: string): Uint8Array {
-    // Strips all spaces, newlines, and rogue quotes from .env strings
     const clean = hex.replace(/[^0-9a-fA-F]/g, '');
     const match = clean.match(/.{1,2}/g);
     if (!match) return new Uint8Array(0);
@@ -63,7 +62,6 @@ export interface SessionState {
     currentTurn: number;
     lastKnownPrice: number;
 
-    // Direct, dynamic instructions injected by the target domain
     sellerInstructions?: string | null;
 
     sandboxSequence?: any;
@@ -92,6 +90,7 @@ export class ClinchCore extends EventEmitter {
     public status: CoreStatus = 'OFFLINE';
     private reconnectAttempts = 0;
     private maxReconnectDelay = 30000;
+    private initTimeout: NodeJS.Timeout | null = null;
 
     public jwtToken: string | null = null;
     private identityPrivKey: Uint8Array;
@@ -100,7 +99,6 @@ export class ClinchCore extends EventEmitter {
     private activeSessions = new Map<string, SessionState>();
     private ws: WebSocket | null = null;
 
-    // Blind Key Pass Local Secret Store
     private localSecrets = new Map<string, { key: string, name?: string }>();
 
     private isSandboxMode = false;
@@ -135,9 +133,6 @@ export class ClinchCore extends EventEmitter {
         }
     }
 
-    // --------------------------------------------------------------------------
-    // BLIND KEY PASS MANAGERS (Silent API Key Handshake)
-    // --------------------------------------------------------------------------
     public registerSecret(domain: string, key: string, name?: string): void {
         const normalizedDomain = domain.toLowerCase().trim();
         this.localSecrets.set(normalizedDomain, { key, name });
@@ -167,17 +162,22 @@ export class ClinchCore extends EventEmitter {
             await this.connectWebSocket();
             this.emit('initialized', { pubKey: this.identityPubKey, registry: this.cachedRegistryUrl });
         } catch (error: any) {
+            if (this.status === 'OFFLINE') return; // User called disconnect during init
             this.setStatus('ERROR');
             this.emit('error', new Error(`Initialization failed: ${error.message}`));
             
-            // If the error points to an authentication or token failure, retry WITHOUT the cached token
-            // to force a fresh PoW challenge and obtain a valid token.
-            const isAuthError = error.message.toLowerCase().includes("auth") || 
-                                error.message.toLowerCase().includes("token") ||
-                                error.message.toLowerCase().includes("payload");
-            
+            const isAuthError = /auth|token|payload/i.test(error.message);
             const retryToken = isAuthError ? undefined : cachedToken;
-            setTimeout(() => this.initialize(retryToken), 5000);
+            
+            return new Promise((resolve, reject) => {
+                this.initTimeout = setTimeout(() => {
+                    if (this.status === 'OFFLINE') {
+                        resolve();
+                        return;
+                    }
+                    this.initialize(retryToken).then(resolve).catch(reject);
+                }, 5000);
+            });
         }
     }
 
@@ -244,7 +244,6 @@ export class ClinchCore extends EventEmitter {
 
             this.ws = new WebSocket(wsUrl);
             
-            // Connection timeout for the TCP handshaking phase
             const connectionTimeout = setTimeout(() => {
                 if (this.ws?.readyState !== WebSocket.OPEN) {
                     this.ws?.close();
@@ -252,7 +251,6 @@ export class ClinchCore extends EventEmitter {
                 }
             }, this.config.timeoutMs);
 
-            // Authentication timeout covering the handshake once connected
             let authTimeout: NodeJS.Timeout;
 
             this.ws.on('open', () => {
@@ -260,7 +258,6 @@ export class ClinchCore extends EventEmitter {
                 this.reconnectAttempts = 0;
                 this.emit('log', '[Network] WebSocket connected. Sending AUTH...');
                 
-                // Set a timeout specifically for waiting on AUTH_SUCCESS or ERROR
                 authTimeout = setTimeout(() => {
                     if (this.status === 'CONNECTING') {
                         this.ws?.close();
@@ -321,7 +318,12 @@ export class ClinchCore extends EventEmitter {
 
     public disconnect() {
         this.setStatus('OFFLINE');
-        if (this.ws) { this.ws.close(); this.ws = null; }
+        if (this.initTimeout) clearTimeout(this.initTimeout);
+        if (this.ws) { 
+            this.ws.removeAllListeners();
+            this.ws.close(); 
+            this.ws = null; 
+        }
     }
 
     public exportSessionState(sessionId: string): string {
@@ -786,7 +788,7 @@ export interface SellerRecord {
   categories:          string[];
   capabilities:        string[];
   display_name?:       string;
-  custom_instructions?: string; // Strictly typed dynamic record instructions mapping
+  custom_instructions?: string;
 }
 
 export class ClinchSeller extends EventEmitter {
