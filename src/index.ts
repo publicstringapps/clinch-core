@@ -91,6 +91,7 @@ export class ClinchCore extends EventEmitter {
     private reconnectAttempts = 0;
     private maxReconnectDelay = 30000;
     private initTimeout: NodeJS.Timeout | null = null;
+    private reconnectTimeout: NodeJS.Timeout | null = null;
 
     public jwtToken: string | null = null;
     private identityPrivKey: Uint8Array;
@@ -133,6 +134,9 @@ export class ClinchCore extends EventEmitter {
         }
     }
 
+    // --------------------------------------------------------------------------
+    // BLIND KEY PASS MANAGERS
+    // --------------------------------------------------------------------------
     public registerSecret(domain: string, key: string, name?: string): void {
         const normalizedDomain = domain.toLowerCase().trim();
         this.localSecrets.set(normalizedDomain, { key, name });
@@ -142,6 +146,19 @@ export class ClinchCore extends EventEmitter {
     public clearSecret(domain: string): void {
         const normalizedDomain = domain.toLowerCase().trim();
         this.localSecrets.delete(normalizedDomain);
+    }
+
+    public getSecret(domain: string): string | null {
+        const secret = this.localSecrets.get(domain.toLowerCase().trim());
+        return secret ? secret.key : null;
+    }
+
+    public listRegisteredSecrets(): Array<{ domain: string, name?: string, key: string }> {
+        return Array.from(this.localSecrets.entries()).map(([domain, data]) => ({
+            domain,
+            name: data.name,
+            key: data.key
+        }));
     }
 
     async initialize(cachedToken?: string): Promise<void> {
@@ -304,7 +321,12 @@ export class ClinchCore extends EventEmitter {
             this.ws.on('close', () => {
                 clearTimeout(connectionTimeout);
                 if (authTimeout) clearTimeout(authTimeout);
-                if (this.status !== 'OFFLINE') this.handleReconnect();
+                
+                // CRITICAL FIX: Only spawn a background WS reconnect if we were successfully connected previously.
+                // If initialization failed (status === 'ERROR'), let the initialize() retry block handle it.
+                if (this.status === 'IDLE' || this.status === 'RECONNECTING') {
+                    this.handleReconnect();
+                }
             });
         });
     }
@@ -313,12 +335,13 @@ export class ClinchCore extends EventEmitter {
         this.setStatus('RECONNECTING');
         this.reconnectAttempts++;
         const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), this.maxReconnectDelay);
-        setTimeout(() => this.connectWebSocket().catch(() => {}), delay);
+        this.reconnectTimeout = setTimeout(() => this.connectWebSocket().catch(() => {}), delay);
     }
 
     public disconnect() {
         this.setStatus('OFFLINE');
         if (this.initTimeout) clearTimeout(this.initTimeout);
+        if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
         if (this.ws) { 
             this.ws.removeAllListeners();
             this.ws.close(); 
