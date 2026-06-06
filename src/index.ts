@@ -3,778 +3,89 @@ import nacl from 'tweetnacl';
 import { sha256 } from 'js-sha256';
 import WebSocket from 'ws';
 
-// ============================================================================
-// CONFIGURATION & UTILS
-// ============================================================================
-const PROTOCOL_VERSION = "0.1.0";
-const FIREBASE_CONFIG_URL = "https://clinchprotocol.web.app/network-config.json";
-
-function toHex(arr: Uint8Array | number[]): string {
-    return Array.from(arr).map((b: number) => b.toString(16).padStart(2, '0')).join('');
+export enum NegotiationState {
+    NEGOTIATING = 'NEGOTIATING',
+    PROPOSED = 'PROPOSED',
+    COUNTERED = 'COUNTERED',
+    CONFIRMED = 'CONFIRMED',
+    SIGNED = 'SIGNED',
+    CANCELLED = 'CANCELLED'
 }
 
-function fromHex(hex: string): Uint8Array {
-    const clean = hex.replace(/[^0-9a-fA-F]/g, '');
-    const match = clean.match(/.{1,2}/g);
-    if (!match) return new Uint8Array(0);
-    return new Uint8Array(match.map((byte: string) => parseInt(byte, 16)));
-}
-
-// ============================================================================
-// TYPES & INTERFACES
-// ============================================================================
-export type CoreStatus =
-    | 'OFFLINE'
-    | 'CONNECTING'
-    | 'IDLE'
-    | 'RECONNECTING'
-    | 'ERROR'
-    | 'NEGOTIATING'
-    | 'CONVERGED'
-    | 'STALEMATE';
-
-export interface ParsedAddress {
-    mode: string;
-    domain: string;
-    route: string;
-}
-
-export interface ClinchConfig {
-    registryUrl?: string;
-    timeoutMs?: number;
-}
-
-export interface ConstraintVector {
-    intent: string;
-    category?: string;
-    max_budget: number;
-    [key: string]: any;
+export interface DealArtifact {
+    sessionId: string;
+    buyerPubKey: string;
+    sellerPubKey: string;
+    item: string;
+    price: number;
+    terms: any;
+    buyerSignature: string | null;
+    sellerSignature: string | null;
+    registrySignature?: string; // NEW
+    chainHash?: string;         // NEW
+    timestamp: number;
 }
 
 export interface SessionState {
     sessionId: string;
-    sellerId: string;
-    keyPair: nacl.SignKeyPair;
-    status: 'ACTIVE' | 'EXITED' | 'CLOSED';
-    exitTokenHash?: string;
-    constraints: ConstraintVector;
-
+    targetId: string;
+    state: NegotiationState;
+    constraints: any;
     currentTurn: number;
-    lastKnownPrice: number;
-
-    sellerInstructions?: string | null;
-
-    sandboxSequence?: any;
-    sandboxSession?: any;
+    lastPrice: number;
+    customInstructions?: string; // NEW
+    artifact: DealArtifact | null;
+    seenMessageIds: string[];
 }
 
-export interface SandboxConfig {
-    downloadLLM?: boolean;
-    modelUrl?: string;
-    modelPath?: string;
-    maxTurns?: number;
+export interface CoreConfig {
+    registryUrl: string;
+    privateKeyHex: string;
+    blindKeys?: Record<string, string>; // NEW: Vault passes these in
 }
 
-export interface AgentAdapter {
-  evaluateOffer(sessionState: any, constraints: any): Promise<any>;
+function toHex(arr: Uint8Array): string {
+    return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// ============================================================================
-// THE CLINCH CORE LIBRARY (Buyer)
-// ============================================================================
+function fromHex(hex: string): Uint8Array {
+    const match = hex.replace(/[^0-9a-fA-F]/g, '').match(/.{1,2}/g);
+    return match ? new Uint8Array(match.map(b => parseInt(b, 16))) : new Uint8Array(0);
+}
 
 export class ClinchCore extends EventEmitter {
-    private config: ClinchConfig;
-    private cachedRegistryUrl: string | null = null;
-
-    public status: CoreStatus = 'OFFLINE';
-    private reconnectAttempts = 0;
-    private maxReconnectDelay = 30000;
-    private initTimeout: NodeJS.Timeout | null = null;
-    private reconnectTimeout: NodeJS.Timeout | null = null;
-
+    private config: CoreConfig;
+    private keyPair: nacl.SignKeyPair;
+    public pubKeyHex: string;
     public jwtToken: string | null = null;
-    private identityPrivKey: Uint8Array;
-    public identityPubKey: string;
-
-    private activeSessions = new Map<string, SessionState>();
     private ws: WebSocket | null = null;
+    private sessions = new Map<string, SessionState>();
 
-    private localSecrets = new Map<string, { key: string, name?: string }>();
-
-    private isSandboxMode = false;
-    private sandboxModelContext: any = null;
-    private sandboxMaxTurns = 6;
-
-    public get activeNegotiationId(): string | null {
-        return Array.from(this.activeSessions.keys()).pop() || null;
-    }
-
-    constructor(config: ClinchConfig = {}) {
+    constructor(config: CoreConfig) {
         super();
-        this.config = { timeoutMs: 5000, ...config };
-
-        const keyPair = nacl.sign.keyPair();
-        this.identityPrivKey = keyPair.secretKey;
-        this.identityPubKey = toHex(keyPair.publicKey);
-
-        if (this.config.registryUrl) {
-            this.cachedRegistryUrl = this.config.registryUrl;
-        }
+        this.config = { blindKeys: {}, ...config };
+        this.keyPair = nacl.sign.keyPair.fromSecretKey(fromHex(config.privateKeyHex));
+        this.pubKeyHex = toHex(this.keyPair.publicKey);
     }
 
-    private setStatus(newStatus: CoreStatus) {
-        if (this.status !== newStatus) {
-            this.status = newStatus;
-            this.emit('status_changed', this.status);
-
-            if (this.status === 'IDLE') this.emit('log', `🟢 [State] ONLINE & IDLE`);
-            else if (this.status === 'ERROR') this.emit('log', `🔴 [State] ERROR`);
-            else this.emit('log', `🟡 [State] ${this.status}`);
-        }
+    public exportSessions(): Record<string, SessionState> { return Object.fromEntries(this.sessions); }
+    public importSessions(data: Record<string, SessionState>): void {
+        for (const [id, session] of Object.entries(data)) this.sessions.set(id, session);
     }
+    public getSession(id: string): SessionState | undefined { return this.sessions.get(id); }
 
-    // --------------------------------------------------------------------------
-    // BLIND KEY PASS MANAGERS
-    // --------------------------------------------------------------------------
-    public registerSecret(domain: string, key: string, name?: string): void {
-        const normalizedDomain = domain.toLowerCase().trim();
-        this.localSecrets.set(normalizedDomain, { key, name });
-        this.emit('log', `[Security] Blind key registered for ${normalizedDomain} (${name || 'Unnamed'})`);
-    }
-
-    public clearSecret(domain: string): void {
-        const normalizedDomain = domain.toLowerCase().trim();
-        this.localSecrets.delete(normalizedDomain);
-    }
-
-    public getSecret(domain: string): string | null {
-        const secret = this.localSecrets.get(domain.toLowerCase().trim());
-        return secret ? secret.key : null;
-    }
-
-    public listRegisteredSecrets(): Array<{ domain: string, name?: string, key: string }> {
-        return Array.from(this.localSecrets.entries()).map(([domain, data]) => ({
-            domain,
-            name: data.name,
-            key: data.key
-        }));
-    }
-
-    async initialize(cachedToken?: string): Promise<void> {
-        if (this.status === 'IDLE' || this.status === 'CONNECTING') return;
-        this.setStatus('CONNECTING');
-
-        try {
-            this.emit('log', '[Network] Fetching registry configuration...');
-            await this.getRegistryUrl();
-
-            if (cachedToken) {
-                this.jwtToken = cachedToken;
-                this.emit('log', "[Auth] Restored session from cached JWT. Skipping PoW.");
-            } else {
-                await this.registerNode();
-            }
-
-            await this.connectWebSocket();
-            this.emit('initialized', { pubKey: this.identityPubKey, registry: this.cachedRegistryUrl });
-        } catch (error: any) {
-            if (this.status === 'OFFLINE') return; // User called disconnect during init
-            this.setStatus('ERROR');
-            this.emit('error', new Error(`Initialization failed: ${error.message}`));
-            
-            const isAuthError = /auth|token|payload/i.test(error.message);
-            const retryToken = isAuthError ? undefined : cachedToken;
-            
-            return new Promise((resolve, reject) => {
-                this.initTimeout = setTimeout(() => {
-                    if (this.status === 'OFFLINE') {
-                        resolve();
-                        return;
-                    }
-                    this.initialize(retryToken).then(resolve).catch(reject);
-                }, 5000);
-            });
-        }
-    }
-
-    private async getRegistryUrl(forceRefresh = false): Promise<string> {
-        if (this.cachedRegistryUrl && !forceRefresh) return this.cachedRegistryUrl;
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-        try {
-            const res = await fetch(FIREBASE_CONFIG_URL, { signal: controller.signal });
-            clearTimeout(timeout);
-            const text = await res.text();
-            const config = JSON.parse(text);
-            this.cachedRegistryUrl = config.registry_nodes[PROTOCOL_VERSION];
-            return this.cachedRegistryUrl!;
-        } catch (err: any) {
-            clearTimeout(timeout);
-            throw new Error(`Registry config fetch failed: ${err.message}`);
-        }
-    }
-
-    private async networkRequest(endpoint: string, options: any = {}, requireAuth = true): Promise<any> {
-        const baseUrl = await this.getRegistryUrl();
-        const headers: any = { ...options.headers };
-        if (requireAuth && this.jwtToken) headers['Authorization'] = `Bearer ${this.jwtToken}`;
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
-        try {
-            const res = await fetch(`${baseUrl}${endpoint}`, { ...options, headers, signal: controller.signal });
-            clearTimeout(timeout);
-            const text = await res.text();
-            if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
-            return JSON.parse(text);
-        } catch (err: any) {
-            clearTimeout(timeout);
-            throw new Error(`Network request to ${endpoint} failed: ${err.message}`);
-        }
-    }
-
-    private async registerNode(): Promise<void> {
-        this.emit('log', "[Auth] Requesting PoW challenge from registry...");
-        const challenge = await this.networkRequest('/api/auth/challenge', {}, false);
-        const powSolution = await this.solvePoW(challenge.nonce, challenge.difficulty);
-
-        this.emit('log', "[Auth] Submitting PoW solution...");
-        const authRes = await this.networkRequest('/api/auth/verify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                challenge_id: challenge.challenge_id,
-                pow_solution: powSolution,
-                pubKey: this.identityPubKey
-            })
-        }, false);
-
-        this.jwtToken = authRes.token;
-        this.emit('token_issued', { token: this.jwtToken });
-    }
-
-    private async connectWebSocket(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const wsUrl = this.cachedRegistryUrl!.replace(/^http/, 'ws');
-            this.emit('log', `[Network] Connecting to WebSocket at ${wsUrl}...`);
-
-            this.ws = new WebSocket(wsUrl);
-            
-            const connectionTimeout = setTimeout(() => {
-                if (this.ws?.readyState !== WebSocket.OPEN) {
-                    this.ws?.close();
-                    reject(new Error("WebSocket connection timeout"));
-                }
-            }, this.config.timeoutMs);
-
-            let authTimeout: NodeJS.Timeout;
-
-            this.ws.on('open', () => {
-                clearTimeout(connectionTimeout);
-                this.reconnectAttempts = 0;
-                this.emit('log', '[Network] WebSocket connected. Sending AUTH...');
-                
-                authTimeout = setTimeout(() => {
-                    if (this.status === 'CONNECTING') {
-                        this.ws?.close();
-                        reject(new Error("WebSocket authentication timed out"));
-                    }
-                }, this.config.timeoutMs);
-
-                this.ws!.send(JSON.stringify({ type: 'AUTH', token: this.jwtToken }));
-            });
-
-            this.ws.on('message', (data) => {
-                try {
-                    const msg = JSON.parse(data.toString());
-                    
-                    if (msg.type === 'AUTH_SUCCESS') {
-                        clearTimeout(authTimeout);
-                        this.setStatus('IDLE');
-                        resolve();
-                    }
-                    
-                    if (msg.type === 'ERROR') {
-                        clearTimeout(authTimeout);
-                        this.emit('log', `🔴 [Network] WS Auth Error: ${msg.message}`);
-                        this.ws?.close();
-                        reject(new Error(msg.message || "Unknown authentication error"));
-                    }
-                    
-                    if (msg.type === 'CALLBACK') {
-                        this.emit('log', `🔔 [Network] Received callback for session ${msg.session_id}`);
-                        this.emit('callback_received', { sessionId: msg.session_id, payload: msg.payload });
-                        this.ws!.send(JSON.stringify({ type: 'ACK', id: msg.id }));
-                    }
-                } catch (err: any) {
-                    this.emit('log', `⚠️ [Network] Failed to parse message: ${err.message}`);
-                }
-            });
-
-            this.ws.on('error', (err: any) => {
-                clearTimeout(connectionTimeout);
-                if (authTimeout) clearTimeout(authTimeout);
-                if (this.status === 'CONNECTING') reject(err);
-            });
-
-            this.ws.on('close', () => {
-                clearTimeout(connectionTimeout);
-                if (authTimeout) clearTimeout(authTimeout);
-                
-                // CRITICAL FIX: Only spawn a background WS reconnect if we were successfully connected previously.
-                // If initialization failed (status === 'ERROR'), let the initialize() retry block handle it.
-                if (this.status === 'IDLE' || this.status === 'RECONNECTING') {
-                    this.handleReconnect();
-                }
-            });
+    public async initialize(cachedToken?: string): Promise<void> {
+        if (cachedToken) { this.jwtToken = cachedToken; return; }
+        const challRes = await fetch(`${this.config.registryUrl}/api/auth/challenge`);
+        if (!challRes.ok) throw new Error("Failed to fetch PoW challenge");
+        const chall = await challRes.json();
+        const powSolution = await this.solvePoW(chall.nonce, chall.difficulty);
+        const verifyRes = await fetch(`${this.config.registryUrl}/api/auth/verify`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ challenge_id: chall.challenge_id, pow_solution: powSolution, pubKey: this.pubKeyHex })
         });
-    }
-
-    private handleReconnect() {
-        this.setStatus('RECONNECTING');
-        this.reconnectAttempts++;
-        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), this.maxReconnectDelay);
-        this.reconnectTimeout = setTimeout(() => this.connectWebSocket().catch(() => {}), delay);
-    }
-
-    public disconnect() {
-        this.setStatus('OFFLINE');
-        if (this.initTimeout) clearTimeout(this.initTimeout);
-        if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
-        if (this.ws) { 
-            this.ws.removeAllListeners();
-            this.ws.close(); 
-            this.ws = null; 
-        }
-    }
-
-    public exportSessionState(sessionId: string): string {
-        const session = this.activeSessions.get(sessionId);
-        if (!session) throw new Error("Session not found");
-
-        const exportable = {
-            sessionId: session.sessionId,
-            sellerId: session.sellerId,
-            status: session.status,
-            exitTokenHash: session.exitTokenHash,
-            constraints: session.constraints,
-            currentTurn: session.currentTurn,
-            lastKnownPrice: session.lastKnownPrice,
-            ephemeralSecretKeyHex: toHex(session.keyPair.secretKey),
-            sellerInstructions: session.sellerInstructions
-        };
-
-        return JSON.stringify(exportable);
-    }
-
-    public importSessionState(serializedData: string): void {
-        const data = JSON.parse(serializedData);
-        const secretKey = fromHex(data.ephemeralSecretKeyHex);
-        const keyPair = nacl.sign.keyPair.fromSecretKey(secretKey);
-
-        this.activeSessions.set(data.sessionId, {
-            sessionId: data.sessionId,
-            sellerId: data.sellerId,
-            status: data.status,
-            exitTokenHash: data.exitTokenHash,
-            constraints: data.constraints,
-            currentTurn: data.currentTurn,
-            lastKnownPrice: data.lastKnownPrice,
-            keyPair: keyPair,
-            sellerInstructions: data.sellerInstructions
-        });
-
-        this.emit('log', `[State] Rehydrated session ${data.sessionId} pointing at ${data.sellerId}`);
-    }
-
-    public getSession(sessionId: string): SessionState | undefined {
-        return this.activeSessions.get(sessionId);
-    }
-
-    public buildAgentPrompt(sessionId: string, incomingMessage: string): string {
-        const session = this.activeSessions.get(sessionId);
-        if (!session) throw new Error("Cannot build prompt: Session not found.");
-
-        const gap = session.lastKnownPrice - session.constraints.max_budget;
-        const gapText = gap > 0 ? `-$${gap} (Over budget)` : `+$${Math.abs(gap)} (Under budget)`;
-
-        const customInstructionsBlock = session.sellerInstructions
-            ? `\nCUSTOM INSTRUCTIONS DIRECT FROM TARGET DOMAIN (${session.sellerId}):\n"""\n${session.sellerInstructions}\n"""\n`
-            : "";
-
-        return `You are a professional AI purchasing agent negotiating via the Clinch Protocol.
-Your only goal is to secure the requested item below the maximum budget.
-
-NEGOTIATION STATE:
-- Item: ${session.constraints.item}
-- Category: ${session.constraints.category || 'General'}
-- Your absolute max budget: $${session.constraints.max_budget}
-- Current turn: ${session.currentTurn}
-- Last seller price: $${session.lastKnownPrice}
-- Gap to budget: ${gapText}
-${customInstructionsBlock}
-SELLER'S LATEST MESSAGE:
-"${incomingMessage}"
-
-STRATEGY GUIDELINES:
-- Turns 1-2: Open roughly 20-30% below budget to establish an anchor. Be professional but firm.
-- Turns 3-5: Move in small, calculated increments (3-5%).
-- Turn 6+: Issue a final, compelling offer.
-- If the seller's price is at or below your max budget: You MUST choose "accept".
-
-OUTPUT FORMAT:
-You MUST respond ONLY in valid JSON matching this exact schema. Do not include markdown blocks (like \`\`\`json).
-{
-  "action": "counter" | "accept" | "exit",
-  "price": <numeric value, no currency symbols>,
-  "message": "<One concise sentence of negotiation dialogue>"
-}`;
-    }
-
-    async search(query: string, mode?: string): Promise<any> {
-        let url = `/api/discover?category=${encodeURIComponent(query)}`;
-        if (mode) url += `&mode=${encodeURIComponent(mode)}`;
-        return await this.networkRequest(url);
-    }
-
-    async negotiate(address: string, constraints: ConstraintVector): Promise<string> {
-        this.emit('log', `[Protocol] Handshaking with ${address}...`);
-        const parsed = this.parseAddress(address);
-
-        const ephemeralKeys = nacl.sign.keyPair();
-        const ephemeralPubHex = toHex(ephemeralKeys.publicKey);
-
-        const blindSecret = this.localSecrets.get(parsed.domain);
-
-        const initPayload: any = {
-            clinch_version: PROTOCOL_VERSION,
-            mode: parsed.mode,
-            constraints,
-            session_pub_key: ephemeralPubHex,
-            timestamp_utc: new Date().toISOString()
-        };
-
-        if (blindSecret) {
-            initPayload.blind_auth_token = blindSecret.key;
-            this.emit('log', `[Security] Silently injected blind token for ${parsed.domain} at transport layer`);
-        }
-
-        const msgUint8 = new TextEncoder().encode(JSON.stringify(initPayload));
-        const signature = toHex(nacl.sign.detached(msgUint8, ephemeralKeys.secretKey));
-
-        const response = await this.networkRequest(`/api/route/${parsed.domain}/handshake`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ...initPayload, sig: signature })
-        });
-
-        const instructions = response.custom_instructions || null;
-
-        this.activeSessions.set(response.session_id, {
-            sessionId: response.session_id,
-            sellerId: parsed.domain,
-            keyPair: ephemeralKeys,
-            status: 'ACTIVE',
-            constraints,
-            currentTurn: 1,
-            lastKnownPrice: 0,
-            sellerInstructions: instructions
-        });
-
-        this.setStatus('NEGOTIATING');
-        this.emit('session_started', { sessionId: response.session_id, sellerId: parsed.domain });
-        return response.session_id;
-    }
-
-    async sendCounter(sessionId: string, price: number, reason: string): Promise<void> {
-        const session = this.activeSessions.get(sessionId);
-        if (!session) throw new Error("Active session not found");
-
-        const payload = { session_id: sessionId, turn: session.currentTurn, price, reason };
-        const buyer_sig = toHex(nacl.sign.detached(
-            new TextEncoder().encode(JSON.stringify(payload)),
-            session.keyPair.secretKey
-        ));
-
-        const response = await this.networkRequest(`/api/route/${session.sellerId}/counter`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ...payload, buyer_sig })
-        });
-
-        if (response.msg_type === 'accept' || response.status === 'COMMITTED') {
-            session.status = 'CLOSED';
-            session.lastKnownPrice = response.price || price;
-            this.emit('session_closed', { sessionId, outcome: 'deal', finalPrice: session.lastKnownPrice });
-        }
-    }
-
-    async exitSession(sessionId: string): Promise<string> {
-        const session = this.activeSessions.get(sessionId);
-        if (!session) throw new Error("Session not found");
-
-        const res = await this.networkRequest(`/api/route/${sessionId}/exit`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ seller_id: session.sellerId })
-        });
-
-        session.status = 'EXITED';
-        session.exitTokenHash = res.token_hash;
-        return res.token_hash;
-    }
-
-    public async negotiateCascade(
-        category: string,
-        constraints: ConstraintVector,
-        maxSellers = 3,
-        strategy: 'sequential' | 'parallel' = 'sequential'
-    ): Promise<{ sessionId: string, sellerId: string, finalPrice: number } | null> {
-        this.emit('log', `[Cascade] Querying registry for matching sellers under "${category}"...`);
-        const discovery = await this.search(category);
-        const sellers: any[] = (discovery.results || []).slice(0, maxSellers);
-
-        if (sellers.length === 0) {
-            this.emit('log', `[Cascade] No matching sellers found for category: "${category}"`);
-            return null;
-        }
-
-        if (strategy === 'parallel') {
-            this.emit('log', `[Cascade] ⚡ Running PARALLEL RACE simultaneously across ${sellers.length} seller nodes...`);
-
-            const sessionPromises = sellers.map(async (seller: any) => {
-                const targetAddress = `ANP/C.${seller.agent_id}`;
-                try {
-                    const sessionId = await this.negotiate(targetAddress, constraints);
-                    const result = await this.waitForSession(sessionId);
-                    return { sellerId: seller.agent_id, sessionId, ...result };
-                } catch (e: any) {
-                    this.emit('log', `[Cascade] ⚠️ Connection failed for parallel channel ${seller.agent_id}: ${e.message}`);
-                    return { sellerId: seller.agent_id, sessionId: '', outcome: 'stalemate' as const, price: Infinity };
-                }
-            });
-
-            const results = await Promise.all(sessionPromises);
-            const successfulDeals = results.filter((r: any) => r.outcome === 'deal' && r.price <= constraints.max_budget);
-
-            if (successfulDeals.length === 0) {
-                this.emit('log', `[Cascade] ✗ Parallel race completed. No successful deals reached.`);
-                return null;
-            }
-
-            successfulDeals.sort((a: any, b: any) => a.price - b.price);
-            const winner = successfulDeals[0];
-
-            this.emit('log', `[Cascade] 🏆 Parallel race complete! Lowest offer: $${winner.price} from ${winner.sellerId}`);
-            return {
-                sessionId: winner.sessionId,
-                sellerId: winner.sellerId,
-                finalPrice: winner.price
-            };
-        }
-
-        this.emit('log', `[Cascade] ➔ Running SEQUENTIAL SQUEEZE across ${sellers.length} seller nodes...`);
-        let bestDeal: { sessionId: string, sellerId: string, finalPrice: number } | null = null;
-        let currentBudgetCeiling = constraints.max_budget;
-
-        for (const seller of sellers) {
-            const targetAddress = `ANP/C.${seller.agent_id}`;
-            this.emit('log', `\n[Cascade] Squeezing target: ${targetAddress} | Squeeze Ceiling: $${currentBudgetCeiling}`);
-
-            const sessionConstraints = {
-                ...constraints,
-                max_budget: currentBudgetCeiling
-            };
-
-            try {
-                const sessionId = await this.negotiate(targetAddress, sessionConstraints);
-                const result = await this.waitForSession(sessionId);
-
-                if (result.outcome === 'deal' && result.price < currentBudgetCeiling) {
-                    this.emit('log', `[Cascade] ✓ Better deal clinched at $${result.price} from ${seller.agent_id}!`);
-                    bestDeal = {
-                        sessionId,
-                        sellerId: seller.agent_id,
-                        finalPrice: result.price
-                    };
-                    currentBudgetCeiling = result.price;
-                } else {
-                    this.emit('log', `[Cascade] ✗ Seller ${seller.agent_id} failed to beat current best offer of $${currentBudgetCeiling}`);
-                }
-            } catch (e: any) {
-                this.emit('log', `[Cascade] ⚠️ Dynamic session error with ${seller.agent_id}: ${e.message}`);
-            }
-        }
-
-        return bestDeal;
-    }
-
-    private waitForSession(sessionId: string): Promise<{ outcome: 'deal' | 'stalemate', price: number }> {
-        return new Promise((resolve) => {
-            const onClosed = (event: any) => {
-                if (event.sessionId === sessionId) {
-                    this.off('session_closed', onClosed);
-                    this.off('status_changed', onStatus);
-                    resolve({ outcome: 'deal', price: event.finalPrice });
-                }
-            };
-            const onStatus = (status: CoreStatus) => {
-                if (status === 'STALEMATE') {
-                    this.off('session_closed', onClosed);
-                    this.off('status_changed', onStatus);
-                    resolve({ outcome: 'stalemate', price: Infinity });
-                }
-            };
-            this.on('session_closed', onClosed);
-            this.on('status_changed', onStatus);
-        });
-    }
-
-    async sandbox(config: SandboxConfig = {}): Promise<void> {
-        this.isSandboxMode = true;
-        this.sandboxMaxTurns = config.maxTurns || 6;
-
-        await this.initialize();
-        await this.setupSandbox(config);
-
-        this.on('callback_received', async (event) => {
-            if (!this.isSandboxMode) return;
-            await this.handleAutomaticSandboxTurn(event.sessionId, event.payload);
-        });
-        this.emit('log', "⚙️ [Sandbox] Auto-Negotiation engine bound and active.");
-    }
-
-    private async setupSandbox(config: SandboxConfig = {}): Promise<void> {
-        if (this.sandboxModelContext) return;
-
-        const settings = {
-            downloadLLM: true,
-            modelUrl: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
-            modelPath: "./qwen2.5-1.5b-instruct-q4_k_m.gguf",
-            ...config
-        };
-
-        let nodeLlama;
-        try { nodeLlama = await import('node-llama-cpp'); }
-        catch (e) { throw new Error("Sandbox requires 'node-llama-cpp'. Run: npm install node-llama-cpp"); }
-
-        const fs = await import('fs');
-        const path = await import('path');
-        const os = await import('os');
-
-        const resolvedPath = path.resolve(settings.modelPath);
-
-        if (!fs.existsSync(resolvedPath)) {
-            if (!settings.downloadLLM) throw new Error(`Model missing at ${resolvedPath}`);
-            this.emit('log', `[Sandbox] Downloading Qwen 1.5B Q4_K_M (1.1GB)...`);
-            const { pipeline } = await import('stream/promises');
-            const { Readable } = await import('stream');
-
-            const response = await fetch(settings.modelUrl);
-            if (!response.ok) throw new Error("Fetch failed: " + response.statusText);
-
-            const fileStream = fs.createWriteStream(resolvedPath);
-            await pipeline(Readable.fromWeb(response.body as any), fileStream);
-            this.emit('log', "[Sandbox] Download complete.");
-        }
-
-        const llama = await nodeLlama.getLlama();
-        const model = await llama.loadModel({ modelPath: resolvedPath });
-
-        this.sandboxModelContext = await model.createContext({
-            contextSize: 2048,
-            threads: Math.min(4, Math.max(1, os.cpus().length - 1)),
-            batchSize: 512
-        });
-    }
-
-    private async handleAutomaticSandboxTurn(sessionId: string, payload: any) {
-        const session = this.activeSessions.get(sessionId);
-        if (!session || session.status !== 'ACTIVE') return;
-
-        session.currentTurn++;
-        this.setStatus('NEGOTIATING');
-        this.emit('log', `⚡ [Sandbox] Analyzing Turn ${session.currentTurn} for ${sessionId}`);
-
-        const incomingPrice = this.extractPrice(payload.message || JSON.stringify(payload), 'Counter');
-        if (incomingPrice !== null) session.lastKnownPrice = incomingPrice;
-
-        if (session.lastKnownPrice > 0 && session.lastKnownPrice <= session.constraints.max_budget) {
-            this.emit('log', `🎉 [Sandbox] Seller met budget conditions! Closing deal.`);
-            await this.sendCounter(sessionId, session.lastKnownPrice, "I accept this offer.");
-            return;
-        }
-
-        if (session.currentTurn > this.sandboxMaxTurns) {
-            this.setStatus('STALEMATE');
-            this.emit('log', `🛑 [Sandbox] Max turns reached. Exiting.`);
-            await this.exitSession(sessionId);
-            return;
-        }
-
-        const modelResponse = await this.sandboxEvaluate(session, payload.message || `The price is $${session.lastKnownPrice}`);
-        const parsedOffer = this.extractPrice(modelResponse, 'Offer') || this.extractPrice(modelResponse, 'price');
-
-        let reason = "Suggesting a fair counter-offer.";
-        try {
-            const parsedJson = JSON.parse(modelResponse.replace(/```json|```/g, "").trim());
-            if (parsedJson.message) reason = parsedJson.message;
-            else if (parsedJson.reason) reason = parsedJson.reason;
-        } catch(e) {}
-
-        if (parsedOffer !== null) {
-            const finalOffer = Math.min(parsedOffer, session.constraints.max_budget);
-            await this.sendCounter(sessionId, finalOffer, reason);
-        } else {
-            this.emit('log', `⚠️ [Sandbox] Failed to parse offer. Generating safe counter.`);
-            await this.sendCounter(sessionId, session.lastKnownPrice * 0.9, "Can you do slightly better?");
-        }
-    }
-
-    private async sandboxEvaluate(session: SessionState, incomingOffer: string): Promise<string> {
-        const { LlamaChatSession, ChatMLChatWrapper } = await import('node-llama-cpp');
-
-        const systemPrompt = this.buildAgentPrompt(session.sessionId, incomingOffer);
-
-        if (!session.sandboxSequence) {
-            session.sandboxSequence = this.sandboxModelContext.getSequence();
-            session.sandboxSession = new LlamaChatSession({
-                contextSequence: session.sandboxSequence,
-                systemPrompt: systemPrompt,
-                chatWrapper: new ChatMLChatWrapper()
-            });
-        }
-
-        let responseText = "";
-        await session.sandboxSession.prompt(incomingOffer, {
-            maxTokens: 120,
-            onTextChunk: (chunk: string) => { responseText += chunk; }
-        });
-
-        return responseText;
-    }
-
-    private extractPrice(text: string, prefix: string): number | null {
-        const regex = new RegExp(`${prefix}\\s*\\:?\\s*\\$?(\\d+(?:\\.\\d{2})?)`, 'i');
-        const match = text.match(regex);
-        if (match) return parseFloat(match[1]);
-
-        const fallbackRegex = /"price"\s*:\s*(\d+(?:\.\d{2})?)/i;
-        const fallbackMatch = text.match(fallbackRegex);
-        return fallbackMatch ? parseFloat(fallbackMatch[1]) : null;
-    }
-
-    public parseAddress(address: string): ParsedAddress {
-        if (!address.includes('.')) throw new Error("Invalid Address Format. Expected MODE.domain (e.g. ANP/C.amazon.anp)");
-
-        const firstDotIdx = address.indexOf('.');
-        const mode = address.substring(0, firstDotIdx);
-        const domain = address.substring(firstDotIdx + 1).toLowerCase();
-
-        if (!mode.startsWith("ANP/")) throw new Error(`Invalid protocol mode '${mode}'. Must start with 'ANP/'`);
-
-        return { mode, domain, route: '/' };
+        if (!verifyRes.ok) throw new Error("PoW verification failed");
+        this.jwtToken = (await verifyRes.json()).token;
     }
 
     private async solvePoW(nonce: string, difficultyBits: number): Promise<string> {
@@ -783,7 +94,7 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         while (true) {
             for (let i = 0; i < CHUNK_SIZE; i++) {
                 const attempt = counter.toString();
-                const hashArray = sha256.create().update(nonce + this.identityPubKey + attempt).array();
+                const hashArray = sha256.create().update(nonce + this.pubKeyHex + attempt).array();
                 if (this.hasLeadingZeroBits(hashArray, difficultyBits)) return attempt;
                 counter++;
             }
@@ -799,95 +110,190 @@ You MUST respond ONLY in valid JSON matching this exact schema. Do not include m
         }
         return zeroBits >= bits;
     }
-}
 
-// ============================================================================
-// THE CLINCH SELLER LIBRARY (Server-Side)
-// ============================================================================
-export interface SellerRecord {
-  agent_id:            string;
-  endpoint:            string;
-  supported_modes:     string[];
-  categories:          string[];
-  capabilities:        string[];
-  display_name?:       string;
-  custom_instructions?: string;
-}
+    private async _makeFetch(endpoint: string, method: string, payload: any = {}): Promise<Response> {
+        const msgBytes = new TextEncoder().encode(JSON.stringify(payload));
+        const sig = toHex(nacl.sign.detached(msgBytes, this.keyPair.secretKey));
+        const headers: any = { 'Content-Type': 'application/json', 'X-Clinch-PubKey': this.pubKeyHex, 'X-Clinch-Sig': sig };
+        if (this.jwtToken) headers['Authorization'] = `Bearer ${this.jwtToken}`;
+        return fetch(`${this.config.registryUrl}${endpoint}`, { method, headers, body: method !== 'GET' ? JSON.stringify(payload) : undefined });
+    }
 
-export class ClinchSeller extends EventEmitter {
-  private config:           ClinchConfig;
-  private cachedRegistryUrl: string | null = null;
-  private identityPrivKey:  Uint8Array;
-  public  identityPubKey:   string;
-
-  constructor(config: ClinchConfig & { privateKeyHex?: string } = {}) {
-    super();
-    this.config = { timeoutMs: 8000, ...config };
-
-    if (config.privateKeyHex) {
-      try {
-        const cleanHex = config.privateKeyHex.replace(/[^0-9a-fA-F]/g, '');
-        if (cleanHex.length !== 128) {
-            throw new Error(`Expected 128 hex chars (64 bytes), got ${cleanHex.length}`);
+    public async request(endpoint: string, method: string, payload: any = {}): Promise<any> {
+        let res = await this._makeFetch(endpoint, method, payload);
+        if (res.status === 401 && this.jwtToken) {
+            this.jwtToken = null;
+            await this.initialize();
+            res = await this._makeFetch(endpoint, method, payload);
         }
-        this.identityPrivKey = fromHex(cleanHex);
-        const kp = nacl.sign.keyPair.fromSecretKey(this.identityPrivKey);
-        this.identityPubKey = toHex(kp.publicKey);
-        this.emit('log', `[Seller] Loaded permanent identity. PubKey: ${this.identityPubKey.substring(0, 12)}...`);
-      } catch (e: any) {
-        throw new Error(`[Seller] Invalid privateKeyHex in constructor: ${e.message}`);
-      }
-    } else {
-      const kp = nacl.sign.keyPair();
-      this.identityPrivKey = kp.secretKey;
-      this.identityPubKey  = toHex(kp.publicKey);
-      console.warn('[Seller] ⚠️  No privateKeyHex provided — using ephemeral key. Registry will reject updates unless this key is pre-registered.');
+        if (!res.ok) throw new Error(`Registry HTTP ${res.status}: ${await res.text()}`);
+        return res.json();
     }
 
-    if (this.config.registryUrl) {
-      this.cachedRegistryUrl = this.config.registryUrl;
+    public connectDaemonStream(): void {
+        if (!this.jwtToken) throw new Error("Must initialize Core with JWT before connecting stream");
+        const wsUrl = this.config.registryUrl.replace(/^http/, 'ws');
+        this.ws = new WebSocket(wsUrl);
+
+        this.ws.on('open', () => {
+            const authPayload = { timestamp: Date.now(), pubKey: this.pubKeyHex };
+            const sig = toHex(nacl.sign.detached(new TextEncoder().encode(JSON.stringify(authPayload)), this.keyPair.secretKey));
+            this.ws?.send(JSON.stringify({ type: 'AUTH', token: this.jwtToken, payload: authPayload, sig }));
+            this.emit('daemon_connected');
+        });
+
+        this.ws.on('message', (data) => {
+            const msg = JSON.parse(data.toString());
+            if (msg.type === 'CALLBACK') this.processIncoming(msg.payload);
+        });
+
+        this.ws.on('close', () => setTimeout(() => this.connectDaemonStream(), 5000));
     }
-  }
 
-  private async resolveRegistry(): Promise<string> {
-    if (this.cachedRegistryUrl) return this.cachedRegistryUrl;
-    const res = await fetch(FIREBASE_CONFIG_URL);
-    const cfg = JSON.parse(await res.text());
-    this.cachedRegistryUrl = cfg.registry_nodes[PROTOCOL_VERSION];
-    return this.cachedRegistryUrl!;
-  }
-
-  async registerEndpoint(record: SellerRecord): Promise<any> {
-    const registry = await this.resolveRegistry();
-
-    const payload = { ...record, timestamp: Date.now() };
-    const msgUint8 = new TextEncoder().encode(JSON.stringify(payload));
-    const signature = toHex(nacl.sign.detached(msgUint8, this.identityPrivKey));
-
-    const res = await fetch(`${registry}/api/sellers/update-endpoint`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        payload,
-        public_key: this.identityPubKey,
-        signature
-      })
-    });
-
-    if (!res.ok) throw new Error(`Endpoint registration failed: ${await res.text()}`);
-    const data = await res.json();
-    this.emit('log', `[Seller] Registered: ${record.agent_id} → ${record.endpoint}`);
-    return data;
-  }
-
-  verifyBuyerSignature(payload: any, signatureHex: string, buyerPubKeyHex: string): boolean {
-    try {
-      const msg    = new TextEncoder().encode(JSON.stringify(payload));
-      const sig    = fromHex(signatureHex);
-      const pubKey = fromHex(buyerPubKeyHex);
-      return nacl.sign.detached.verify(msg, sig, pubKey);
-    } catch {
-      return false;
+    public async discover(category: string): Promise<any[]> {
+        const res = await fetch(`${this.config.registryUrl}/api/discover?category=${encodeURIComponent(category)}`);
+        return (await res.json()).results || [];
     }
-  }
+
+    public async registerNode(endpoint: string, categories: string[], capabilities: string[]): Promise<void> {
+        const payload = { agent_id: this.pubKeyHex, endpoint, categories, capabilities, timestamp: Date.now() };
+        await this.request('/api/sellers/update-endpoint', 'POST', { payload });
+    }
+
+    public async proposeDeal(targetDomain: string, constraints: any): Promise<SessionState> {
+        const payload: any = { target: targetDomain, constraints, timestamp: Date.now() };
+        
+        // Blind Key Pass Injection
+        if (this.config.blindKeys && this.config.blindKeys[targetDomain]) {
+            payload.blind_auth_token = this.config.blindKeys[targetDomain];
+        }
+
+        const res = await this.request(`/api/route/${targetDomain}/handshake`, 'POST', payload);
+        
+        const session: SessionState = {
+            sessionId: res.session_id,
+            targetId: targetDomain,
+            state: NegotiationState.PROPOSED,
+            constraints,
+            currentTurn: 1,
+            lastPrice: 0,
+            customInstructions: res.custom_instructions || null, // Saved from Registry DB
+            artifact: null,
+            seenMessageIds: []
+        };
+        
+        if (res.type === 'CONFIRM') {
+            session.state = NegotiationState.CONFIRMED;
+            session.lastPrice = res.price;
+        } else if (res.type === 'COUNTER') {
+            session.state = NegotiationState.COUNTERED;
+            session.lastPrice = res.price;
+            session.currentTurn = res.turn || 2;
+        } else if (res.type === 'CANCEL') {
+            session.state = NegotiationState.CANCELLED;
+        }
+        
+        this.sessions.set(session.sessionId, session);
+        return session;
+    }
+
+    public async counter(sessionId: string, price: number, reason: string): Promise<SessionState> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error("Session not found");
+        if (session.state === NegotiationState.SIGNED || session.state === NegotiationState.CANCELLED) throw new Error(`Cannot counter, deal is ${session.state}`);
+
+        const res = await this.request(`/api/route/${session.targetId}/counter`, 'POST', { session_id: sessionId, turn: session.currentTurn + 1, price, reason });
+        
+        session.currentTurn++;
+        session.lastPrice = price;
+        session.state = NegotiationState.COUNTERED;
+
+        if (res.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = res.price; }
+        else if (res.type === 'COUNTER') { session.state = NegotiationState.COUNTERED; session.lastPrice = res.price; session.currentTurn = res.turn || session.currentTurn + 1; }
+        else if (res.type === 'CANCEL') { session.state = NegotiationState.CANCELLED; }
+        
+        return session;
+    }
+
+    public async cancelSession(sessionId: string): Promise<SessionState> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error("Session not found");
+        await this.request(`/api/route/${session.targetId}/cancel`, 'POST', { session_id: sessionId });
+        session.state = NegotiationState.CANCELLED;
+        return session;
+    }
+
+    public registerIncomingSession(sessionId: string, targetPubKey: string, constraints: any): void {
+        if (!this.sessions.has(sessionId)) {
+            this.sessions.set(sessionId, { sessionId, targetId: targetPubKey, state: NegotiationState.NEGOTIATING, constraints, currentTurn: 1, lastPrice: 0, artifact: null, seenMessageIds: [] });
+        }
+    }
+
+    public updateSessionStateLocally(sessionId: string, state: NegotiationState, price: number, turn?: number): void {
+        const session = this.sessions.get(sessionId);
+        if (session) { session.state = state; session.lastPrice = price; if (turn) session.currentTurn = turn; }
+    }
+
+    public async approveAndSign(sessionId: string): Promise<DealArtifact> {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error("Session not found");
+        if (session.state !== NegotiationState.CONFIRMED) throw new Error(`Approval Gate Blocked: Session state is ${session.state}. Must be CONFIRMED.`);
+
+        const artifact: DealArtifact = {
+            sessionId: session.sessionId, buyerPubKey: this.pubKeyHex, sellerPubKey: session.targetId,
+            item: session.constraints.item || 'Service', price: session.lastPrice, terms: session.constraints,
+            buyerSignature: null, sellerSignature: null, timestamp: Date.now()
+        };
+
+        const msgBytes = new TextEncoder().encode(JSON.stringify({ sessionId: artifact.sessionId, item: artifact.item, price: artifact.price }));
+        artifact.buyerSignature = toHex(nacl.sign.detached(msgBytes, this.keyPair.secretKey));
+
+        const sigRes = await this.request(`/api/route/${session.targetId}/sign_request`, 'POST', { artifact });
+        if (!sigRes.sellerSignature) throw new Error("Seller refused or failed to sign the artifact.");
+        artifact.sellerSignature = sigRes.sellerSignature;
+
+        // Registry commits and returns the 3rd Chain-of-Custody signature
+        const commitRes = await this.request(`/api/route/${sessionId}/commit`, 'POST', { artifact });
+        artifact.registrySignature = commitRes.registry_sig;
+        artifact.chainHash = commitRes.chain_hash;
+
+        session.state = NegotiationState.SIGNED;
+        session.artifact = artifact;
+        return artifact;
+    }
+
+    public signAsSeller(artifact: DealArtifact): string {
+        const session = this.sessions.get(artifact.sessionId);
+        if (!session) throw new Error("Session not found in local state");
+        if (session.state !== NegotiationState.CONFIRMED) throw new Error(`Cannot sign. Session state is ${session.state}, must be CONFIRMED`);
+        if (!artifact.buyerSignature) throw new Error("Artifact is missing buyer signature");
+
+        const msgBytes = new TextEncoder().encode(JSON.stringify({ sessionId: artifact.sessionId, item: artifact.item, price: artifact.price }));
+        if (!nacl.sign.detached.verify(msgBytes, fromHex(artifact.buyerSignature), fromHex(artifact.buyerPubKey))) {
+            throw new Error("Cryptographic verification of buyer signature failed");
+        }
+        return toHex(nacl.sign.detached(msgBytes, this.keyPair.secretKey));
+    }
+
+    private processIncoming(payload: any) {
+        if (!payload.session_id) return;
+        let session = this.sessions.get(payload.session_id);
+        
+        if (!session && payload.type === 'HANDSHAKE') {
+            this.registerIncomingSession(payload.session_id, payload.buyer_pub_key, payload.constraints);
+            session = this.sessions.get(payload.session_id);
+        }
+
+        if (!session) return;
+        if (payload.msg_id) {
+            if (session.seenMessageIds.includes(payload.msg_id)) return;
+            session.seenMessageIds.push(payload.msg_id);
+            if (session.seenMessageIds.length > 100) session.seenMessageIds.shift();
+        }
+
+        if (payload.type === 'CANCEL') { session.state = NegotiationState.CANCELLED; this.emit('session_cancelled', session); }
+        else if (payload.type === 'COUNTER') { session.state = NegotiationState.COUNTERED; session.lastPrice = payload.price; session.currentTurn = payload.turn; this.emit('counter_received', session); }
+        else if (payload.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = payload.price; this.emit('approval_required', session); }
+        else if (payload.type === 'COMMIT') { session.state = NegotiationState.SIGNED; session.artifact = payload.artifact; this.emit('deal_signed', session); }
+    }
 }
