@@ -26,12 +26,27 @@ function fromHex(hex: string): Uint8Array {
 export type CoreStatus = 'OFFLINE' | 'CONNECTING' | 'IDLE' | 'RECONNECTING' | 'ERROR' | 'NEGOTIATING' | 'STALEMATE';
 
 export enum NegotiationState {
-    NEGOTIATING = 'NEGOTIATING', 
-    PROPOSED = 'PROPOSED',       
-    COUNTERED = 'COUNTERED',     
-    CONFIRMED = 'CONFIRMED',     
-    SIGNED = 'SIGNED',           
-    CANCELLED = 'CANCELLED'      
+    NEGOTIATING = 'NEGOTIATING',
+    PROPOSED = 'PROPOSED',
+    COUNTERED = 'COUNTERED',
+    CONFIRMED = 'CONFIRMED',
+    SIGNED = 'SIGNED',
+    CANCELLED = 'CANCELLED'
+}
+
+export interface DiscoveryResult {
+    agent_id: string;
+    endpoint: string;
+    categories: string[];
+    capabilities: string[];
+    display_name: string | null;
+    official_node: boolean;
+    reputation_score: number;
+    tags: string[] | null;
+}
+
+export interface RegisterNodeOptions {
+    tags?: string[];
 }
 
 export interface DealArtifact {
@@ -43,8 +58,8 @@ export interface DealArtifact {
     terms: any;
     buyerSignature: string | null;
     sellerSignature: string | null;
-    registrySignature?: string; 
-    chainHash?: string;         
+    registrySignature?: string;
+    chainHash?: string;
     timestamp: number;
 }
 
@@ -62,7 +77,7 @@ export interface SessionState {
     constraints: ConstraintVector;
     currentTurn: number;
     lastPrice: number;
-    customInstructions?: string | null; 
+    customInstructions?: string | null;
     artifact: DealArtifact | null;
     seenMessageIds: string[];
     sandboxSequence?: any;
@@ -72,7 +87,7 @@ export interface SessionState {
 export interface CoreConfig {
     registryUrl?: string;
     privateKeyHex: string;
-    blindKeys?: Record<string, string>; 
+    blindKeys?: Record<string, string>;
     timeoutMs?: number;
 }
 
@@ -91,15 +106,15 @@ export class ClinchCore extends EventEmitter {
     private keyPair: nacl.SignKeyPair;
     public pubKeyHex: string;
     public jwtToken: string | null = null;
-    
+
     private cachedRegistryUrl: string | null = null;
     private ws: WebSocket | null = null;
     private sessions = new Map<string, SessionState>();
-    
+
     public status: CoreStatus = 'OFFLINE';
     private reconnectAttempts = 0;
     private maxReconnectDelay = 30000;
-    
+
     private isSandboxMode = false;
     private sandboxModelContext: any = null;
     private sandboxMaxTurns = 6;
@@ -128,7 +143,7 @@ export class ClinchCore extends EventEmitter {
     }
     public getSession(id: string): SessionState | undefined { return this.sessions.get(id); }
 
-    // --- DYNAMIC REGISTRY DISCOVERY (RESTORED) ---
+    // --- DYNAMIC REGISTRY DISCOVERY ---
     private async getRegistryUrl(forceRefresh = false): Promise<string> {
         if (this.cachedRegistryUrl && !forceRefresh) return this.cachedRegistryUrl;
         const controller = new AbortController();
@@ -150,13 +165,13 @@ export class ClinchCore extends EventEmitter {
     public async initialize(cachedToken?: string): Promise<void> {
         if (this.status === 'IDLE' || this.status === 'CONNECTING') return;
         this.setStatus('CONNECTING');
-        
+
         try {
             const baseUrl = await this.getRegistryUrl();
-            if (cachedToken) { 
-                this.jwtToken = cachedToken; 
+            if (cachedToken) {
+                this.jwtToken = cachedToken;
                 this.setStatus('IDLE');
-                return; 
+                return;
             }
 
             const challRes = await fetch(`${baseUrl}/api/auth/challenge`);
@@ -207,7 +222,7 @@ export class ClinchCore extends EventEmitter {
     private async _makeFetch(baseUrl: string, endpoint: string, method: string, payload: any = {}): Promise<Response> {
         const msgBytes = new TextEncoder().encode(JSON.stringify(payload));
         const sig = toHex(nacl.sign.detached(msgBytes, this.keyPair.secretKey));
-        
+
         const headers: any = { 'Content-Type': 'application/json', 'X-Clinch-PubKey': this.pubKeyHex, 'X-Clinch-Sig': sig };
         if (this.jwtToken) headers['Authorization'] = `Bearer ${this.jwtToken}`;
 
@@ -217,7 +232,7 @@ export class ClinchCore extends EventEmitter {
     public async request(endpoint: string, method: string, payload: any = {}): Promise<any> {
         const baseUrl = await this.getRegistryUrl();
         let res = await this._makeFetch(baseUrl, endpoint, method, payload);
-        
+
         if (res.status === 401 && this.jwtToken) {
             this.jwtToken = null;
             await this.initialize();
@@ -231,7 +246,7 @@ export class ClinchCore extends EventEmitter {
     public async connectDaemonStream(): Promise<void> {
         const baseUrl = await this.getRegistryUrl();
         if (!this.jwtToken) await this.initialize();
-        
+
         const wsUrl = baseUrl.replace(/^http/, 'ws');
         this.ws = new WebSocket(wsUrl);
 
@@ -256,27 +271,39 @@ export class ClinchCore extends EventEmitter {
     }
 
     // --- PROTOCOL CAPABILITIES ---
-    public async discover(category: string): Promise<any[]> {
+    public async discover(category: string): Promise<DiscoveryResult[]> {
         const baseUrl = await this.getRegistryUrl();
         const res = await fetch(`${baseUrl}/api/discover?category=${encodeURIComponent(category)}`);
         return (await res.json()).results || [];
     }
 
-    public async registerNode(endpoint: string, categories: string[], capabilities: string[]): Promise<void> {
-        const payload = { agent_id: this.pubKeyHex, endpoint, categories, capabilities, timestamp: Date.now() };
+    public async registerNode(
+        endpoint: string,
+        categories: string[],
+        capabilities: string[],
+        options: RegisterNodeOptions = {}
+    ): Promise<void> {
+        const payload = {
+            agent_id: this.pubKeyHex,
+            endpoint,
+            categories,
+            capabilities,
+            tags: options.tags || [],
+            timestamp: Date.now()
+        };
         await this.request('/api/sellers/update-endpoint', 'POST', { payload });
     }
 
     public async proposeDeal(targetDomain: string, constraints: ConstraintVector): Promise<SessionState> {
         const payload: any = { target: targetDomain, constraints, timestamp: Date.now() };
-        
+
         // Blind Key Pass Injection
         if (this.config.blindKeys && this.config.blindKeys[targetDomain]) {
             payload.blind_auth_token = this.config.blindKeys[targetDomain];
         }
 
         const res = await this.request(`/api/route/${targetDomain}/handshake`, 'POST', payload);
-        
+
         const session: SessionState = {
             sessionId: res.session_id,
             targetId: targetDomain,
@@ -284,15 +311,15 @@ export class ClinchCore extends EventEmitter {
             constraints,
             currentTurn: 1,
             lastPrice: 0,
-            customInstructions: res.custom_instructions || null, 
+            customInstructions: res.custom_instructions || null,
             artifact: null,
             seenMessageIds: []
         };
-        
-        if (res.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = res.price; } 
-        else if (res.type === 'COUNTER') { session.state = NegotiationState.COUNTERED; session.lastPrice = res.price; session.currentTurn = res.turn || 2; } 
+
+        if (res.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = res.price; }
+        else if (res.type === 'COUNTER') { session.state = NegotiationState.COUNTERED; session.lastPrice = res.price; session.currentTurn = res.turn || 2; }
         else if (res.type === 'CANCEL') { session.state = NegotiationState.CANCELLED; }
-        
+
         this.sessions.set(session.sessionId, session);
         return session;
     }
@@ -300,10 +327,18 @@ export class ClinchCore extends EventEmitter {
     public async counter(sessionId: string, price: number, reason: string): Promise<SessionState> {
         const session = this.sessions.get(sessionId);
         if (!session) throw new Error("Session not found");
-        if (session.state === NegotiationState.SIGNED || session.state === NegotiationState.CANCELLED) throw new Error(`Cannot counter, deal is ${session.state}`);
+        if (session.state === NegotiationState.SIGNED || session.state === NegotiationState.CANCELLED) {
+            throw new Error(`Cannot counter, deal is ${session.state}`);
+        }
 
-        const res = await this.request(`/api/route/${session.targetId}/counter`, 'POST', { session_id: sessionId, turn: session.currentTurn + 1, price, reason });
-        
+        // Blind Key Pass Injection — mirrors proposeDeal so sellers can validate on every turn
+        const payload: any = { session_id: sessionId, turn: session.currentTurn + 1, price, reason };
+        if (this.config.blindKeys && this.config.blindKeys[session.targetId]) {
+            payload.blind_auth_token = this.config.blindKeys[session.targetId];
+        }
+
+        const res = await this.request(`/api/route/${session.targetId}/counter`, 'POST', payload);
+
         session.currentTurn++;
         session.lastPrice = price;
         session.state = NegotiationState.COUNTERED;
@@ -311,7 +346,7 @@ export class ClinchCore extends EventEmitter {
         if (res.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = res.price; }
         else if (res.type === 'COUNTER') { session.state = NegotiationState.COUNTERED; session.lastPrice = res.price; session.currentTurn = res.turn || session.currentTurn + 1; }
         else if (res.type === 'CANCEL') { session.state = NegotiationState.CANCELLED; }
-        
+
         return session;
     }
 
@@ -323,7 +358,7 @@ export class ClinchCore extends EventEmitter {
         return session;
     }
 
-    // --- CASCADING ITERATIVE SQUEEZE (RESTORED) ---
+    // --- CASCADING ITERATIVE SQUEEZE ---
     public async negotiateCascade(
         category: string,
         constraints: ConstraintVector,
@@ -332,15 +367,14 @@ export class ClinchCore extends EventEmitter {
     ): Promise<{ sessionId: string, sellerId: string, finalPrice: number } | null> {
         this.emit('log', `[Cascade] Querying registry for matching sellers under "${category}"...`);
         const discovery = await this.discover(category);
-        const sellers: any[] = discovery.slice(0, maxSellers);
+        const sellers: DiscoveryResult[] = discovery.slice(0, maxSellers);
 
         if (sellers.length === 0) return null;
 
         if (strategy === 'parallel') {
-            const sessionPromises = sellers.map(async (seller: any) => {
+            const sessionPromises = sellers.map(async (seller: DiscoveryResult) => {
                 try {
                     const session = await this.proposeDeal(seller.agent_id, constraints);
-                    // Mock auto-accept if seller confirms within budget immediately
                     if (session.state === NegotiationState.CONFIRMED && constraints.max_budget !== null && session.lastPrice <= constraints.max_budget) {
                         return { sellerId: seller.agent_id, sessionId: session.sessionId, outcome: 'deal', price: session.lastPrice };
                     }
@@ -374,7 +408,7 @@ export class ClinchCore extends EventEmitter {
         return bestDeal;
     }
 
-    // --- AUTO-NEGOTIATOR SANDBOX (RESTORED) ---
+    // --- AUTO-NEGOTIATOR SANDBOX ---
     public async sandbox(config: SandboxConfig = {}): Promise<void> {
         this.isSandboxMode = true;
         this.sandboxMaxTurns = config.maxTurns || 6;
@@ -391,7 +425,7 @@ export class ClinchCore extends EventEmitter {
                 await this.cancelSession(session.sessionId);
                 return;
             }
-            
+
             const promptStr = this.buildAgentPrompt(session.sessionId, `The price is $${session.lastPrice}`);
             if (!session.sandboxSequence) {
                 session.sandboxSequence = this.sandboxModelContext.getSequence();
@@ -401,7 +435,7 @@ export class ClinchCore extends EventEmitter {
 
             let responseText = "";
             await session.sandboxSession.prompt(`The price is $${session.lastPrice}`, { maxTokens: 120, onTextChunk: (chunk: string) => { responseText += chunk; } });
-            
+
             const match = responseText.match(/"price"\s*:\s*(\d+(?:\.\d{2})?)/i);
             const parsedOffer = match ? parseFloat(match[1]) : session.lastPrice * 0.9;
             await this.counter(session.sessionId, parsedOffer, "Counter offer from Sandbox Agent");
@@ -501,7 +535,7 @@ You MUST respond ONLY in valid JSON matching this exact schema:
     private processIncoming(payload: any) {
         if (!payload.session_id) return;
         let session = this.sessions.get(payload.session_id);
-        
+
         if (!session && payload.type === 'HANDSHAKE') {
             this.registerIncomingSession(payload.session_id, payload.buyer_pub_key, payload.constraints);
             session = this.sessions.get(payload.session_id);
@@ -522,7 +556,7 @@ You MUST respond ONLY in valid JSON matching this exact schema:
 }
 
 // ============================================================================
-// THE CLINCH SELLER LIBRARY (RESTORED EXPORT WRAPPER)
+// THE CLINCH SELLER LIBRARY (EXPORT WRAPPER)
 // ============================================================================
 export class ClinchSeller extends ClinchCore {
     constructor(config: CoreConfig) {
