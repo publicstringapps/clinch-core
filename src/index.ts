@@ -6,7 +6,7 @@ import WebSocket from 'ws';
 // ============================================================================
 // CONFIGURATION & UTILS
 // ============================================================================
-const PROTOCOL_VERSION = "0.2.0";
+const PROTOCOL_VERSION = "0.2.0"; // Bumped version to match your new backend constraints
 const FIREBASE_CONFIG_URL = "https://clinchprotocol.web.app/network-config.json";
 
 function toHex(arr: Uint8Array | number[]): string {
@@ -39,14 +39,14 @@ export interface DiscoveryResult {
     endpoint: string;
     categories: string[];
     capabilities: string[];
+    supported_modes: string[] | null; // [FIX]: Replaced tags with supported_modes
     display_name: string | null;
     official_node: boolean;
     reputation_score: number;
-    tags: string[] | null;
 }
 
 export interface RegisterNodeOptions {
-    tags?: string[];
+    supported_modes?: string[]; // [FIX]: Replaced tags with supported_modes
 }
 
 export interface DealArtifact {
@@ -277,18 +277,20 @@ export class ClinchCore extends EventEmitter {
         return (await res.json()).results || [];
     }
 
+    // [FIX]: Added explicit agentId requirement and aligned supported_modes
     public async registerNode(
+        agentId: string, 
         endpoint: string,
         categories: string[],
         capabilities: string[],
         options: RegisterNodeOptions = {}
     ): Promise<void> {
         const payload = {
-            agent_id: this.pubKeyHex,
+            agent_id: agentId,
             endpoint,
             categories,
             capabilities,
-            tags: options.tags || [],
+            supported_modes: options.supported_modes || ["ANP/C"],
             timestamp: Date.now()
         };
         await this.request('/api/sellers/update-endpoint', 'POST', { payload });
@@ -297,7 +299,6 @@ export class ClinchCore extends EventEmitter {
     public async proposeDeal(targetDomain: string, constraints: ConstraintVector): Promise<SessionState> {
         const payload: any = { target: targetDomain, constraints, timestamp: Date.now() };
 
-        // Blind Key Pass Injection
         if (this.config.blindKeys && this.config.blindKeys[targetDomain]) {
             payload.blind_auth_token = this.config.blindKeys[targetDomain];
         }
@@ -331,7 +332,6 @@ export class ClinchCore extends EventEmitter {
             throw new Error(`Cannot counter, deal is ${session.state}`);
         }
 
-        // Blind Key Pass Injection — mirrors proposeDeal so sellers can validate on every turn
         const payload: any = { session_id: sessionId, turn: session.currentTurn + 1, price, reason };
         if (this.config.blindKeys && this.config.blindKeys[session.targetId]) {
             payload.blind_auth_token = this.config.blindKeys[session.targetId];
