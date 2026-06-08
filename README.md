@@ -1,3 +1,4 @@
+
 # Clinch Core (`clinch-core`)
 
 > **Agent Negotiation Protocol (ANP) — Edge Client & Seller SDK**
@@ -38,30 +39,36 @@ The SDK maintains an isolated, turn-based state machine for each active session.
 *   `IDLE`: Connected and authenticated. Ready to initialize new sessions.
 *   `RECONNECTING`: Socket connection lost; executing exponential backoff.
 *   `NEGOTIATING`: Active, turn-based bargaining sequence in progress.
-*   `CONVERGED`: Mathematical convergence reached; agreement co-signed.
 *   `STALEMATE`: Negotiation terminated; max turns reached without convergence.
 *   `ERROR`: Internal network, compilation, or cryptographic validation failure.
 
 ### Developer Event Subscriptions
 ```typescript
-// Track the operational status of the client
+import { SessionState, CoreStatus } from 'clinch-core';
+
+// Track the operational status of the client connection
 core.on('status_changed', (status: CoreStatus) => {
     console.log(`[Status] Client changed to: ${status}`);
 });
 
-// Fired when a new negotiation handshake is completed
-core.on('session_started', ({ sessionId, sellerId }) => {
-    console.log(`[Session Started] Active ID: ${sessionId} targeting ${sellerId}`);
+// Fired when a counter-offer is received from the counterparty
+core.on('counter_received', (session: SessionState) => {
+    console.log(`[Counter] New offer of $${session.lastPrice} for ${session.constraints.item}`);
 });
 
-// Fired when a session reaches terminal state (deal converged or stalemate)
-core.on('session_closed', ({ sessionId, outcome, finalPrice }) => {
-    console.log(`[Session Closed] ID: ${sessionId} | Outcome: ${outcome} | Price: $${finalPrice}`);
+// Fired when the deal is confirmed by the seller, awaiting buyer's signature/approval
+core.on('approval_required', (session: SessionState) => {
+    console.log(`[Approval Required] Agreement reached at $${session.lastPrice}. Ready to sign!`);
 });
 
-// Fired when an out-of-band message is received via the WS callback channel
-core.on('callback_received', ({ sessionId, payload }) => {
-    console.log(`[Callback] Re-engagement for session ${sessionId} received`);
+// Fired when the bilateral transaction is cryptographically signed and committed
+core.on('deal_signed', (session: SessionState) => {
+    console.log(`[Deal Signed] Transaction finalized! Artifact ID: ${session.artifact?.sessionId}`);
+});
+
+// Fired when the counterparty cleanly cancels/exits the negotiation
+core.on('session_cancelled', (session: SessionState) => {
+    console.log(`[Cancelled] Session ${session.sessionId} terminated.`);
 });
 ```
 
@@ -91,25 +98,28 @@ The local Sandbox runs an optimized **Qwen 2.5 1.5B Q4_K_M** model on local hard
 const { ClinchCore } = require('clinch-core');
 
 async function runAutonomousSession() {
-    const core = new ClinchCore();
+    // Note: ClinchCore constructor requires an Ed25519 private key hex
+    const core = new ClinchCore({ 
+        privateKeyHex: process.env.BUYER_PRIVATE_KEY 
+    });
 
     core.on('log', (msg) => console.log(msg));
-    core.on('session_closed', ({ finalPrice }) => {
-        console.log(`✓ Negotiation completed at $${finalPrice}`);
+    core.on('deal_signed', (session) => {
+        console.log(`✓ Negotiation completed at $${session.lastPrice}`);
     });
 
     // 1. Initialize local LLM, solve PoW, and connect WebSocket
     await core.sandbox({ downloadLLM: true });
 
     // 2. Begin autonomous negotiation
-    const sessionId = await core.negotiate('ANP/C.amazon.anp', {
+    const session = await core.proposeDeal('amazon.anp', {
         intent: 'purchase',
         category: 'electronics',
         item: 'Ninja Blender',
         max_budget: 85.00
     });
 
-    console.log(`Session active: ${sessionId}`);
+    console.log(`Session active: ${session.sessionId}`);
 }
 
 runAutonomousSession();
@@ -123,29 +133,32 @@ import { ClinchCore } from 'clinch-core';
 import Anthropic from '@anthropic-ai/sdk';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const core = new ClinchCore();
+const core = new ClinchCore({ privateKeyHex: process.env.BUYER_PRIVATE_KEY });
 
 await core.initialize();
 
 // 1. Start session
-const sessionId = await core.negotiate('ANP/C.amazon.anp', {
+const session = await core.proposeDeal('amazon.anp', {
     intent: 'purchase',
     item: 'Ninja Blender',
     max_budget: 85.00
 });
 
 // 2. Serialize and persist the state to your DB (Redis, Postgres, etc.)
-const exportedState = core.exportSessionState(sessionId);
-await db.saveSession(sessionId, exportedState);
+const exportedState = core.exportSessions(); 
+await db.saveSession(session.sessionId, exportedState);
 
 // --- LATER, ON A DIFFERENT POD OR ASYNCHRONOUS WEBHOOK TRIGGER --- //
 
-const webhookCore = new ClinchCore();
-webhookCore.importSessionState(exportedState);
+const webhookCore = new ClinchCore({ privateKeyHex: process.env.BUYER_PRIVATE_KEY });
+webhookCore.importSessions(exportedState);
 
-webhookCore.on('callback_received', async (event) => {
-    // 3. Generate system prompt using rehydrated session data
-    const systemPrompt = webhookCore.buildAgentPrompt(event.sessionId, event.payload.message);
+webhookCore.on('counter_received', async (activeSession) => {
+    // 3. Generate system prompt using rehydrated session data and latest incoming price
+    const systemPrompt = webhookCore.buildAgentPrompt(
+        activeSession.sessionId, 
+        `The price is $${activeSession.lastPrice}`
+    );
 
     // 4. Evaluate with hosted LLM
     const msg = await anthropic.messages.create({
@@ -157,13 +170,15 @@ webhookCore.on('callback_received', async (event) => {
 
     const decision = JSON.parse(msg.content[0].text);
 
-    // 5. Submit cryptographic counter-offer
+    // 5. Submit cryptographic counter-offer or approve and sign the deal
     if (decision.action === 'accept') {
-        console.log("Agreement reached!");
+        const artifact = await webhookCore.approveAndSign(activeSession.sessionId);
+        console.log(`Agreement reached and committed! Artifact ID: ${artifact.sessionId}`);
     } else {
-        await webhookCore.sendCounter(event.sessionId, decision.price, decision.message);
+        await webhookCore.counter(activeSession.sessionId, decision.price, decision.message);
+        
         // 6. Update DB with new turn state and counters
-        await db.updateSession(event.sessionId, webhookCore.exportSessionState(event.sessionId));
+        await db.updateSession(activeSession.sessionId, webhookCore.exportSessions());
     }
 });
 ```
@@ -192,16 +207,20 @@ if (bestDeal) {
 ```
 
 ### 4.4 Blind Key Pass (Credential Injection)
-For sessions with services that require authorization tokens or API keys to operate (such as platform execution nodes), you can register these credentials locally.
+For sessions with services that require authorization tokens or API keys to operate (such as platform execution nodes), you can pass these credentials directly into the constructor.
 
 The Core library securely stores these secrets and silently injects them into the handshake transport layer during session initialization. This prevents the API keys from ever being exposed to the AI model's context window, safeguarding you against prompt injection attacks.
 
 ```javascript
-// Register the API credential locally bound to the domain namespace
-core.registerSecret('apify.anp', 'apify_sec_key_xyz987', 'Apify Production Token');
+const core = new ClinchCore({
+    privateKeyHex: process.env.BUYER_PRIVATE_KEY,
+    blindKeys: {
+        'apify.anp': 'apify_sec_key_xyz987' // Domain bound credentials
+    }
+});
 
 // Handshaking with this address now automatically injects the credential silently
-const sessionId = await core.negotiate('ANP/C.apify.anp', {
+const session = await core.proposeDeal('apify.anp', {
     intent: 'purchase',
     item: 'actor-scraper-run',
     max_budget: 5.00
@@ -220,7 +239,7 @@ To prevent centralized token expiration failures, Clinch separates ownership fro
 2. **The Data Plane**: The actual seller server is initialized with the matching permanent private key. On boot, the machine signs its dynamic endpoint configuration locally and publishes it to the registry. No JWTs are used on-wire for machine routing.
 
 ```javascript
-import { ClinchSeller } from 'clinch-core';
+import { ClinchSeller, NegotiationState } from 'clinch-core';
 import express from 'express';
 
 const app = express();
@@ -232,29 +251,34 @@ const seller = new ClinchSeller({
 });
 
 // 2. Publish endpoint to the registry on boot (Self-Signing)
-await seller.registerEndpoint({
-    agent_id: 'amazon.anp',
-    endpoint: 'https://your-seller-api.com', //note, use your base endpoint
-    supported_modes: ['ANP/C'],
-    categories: ['electronics'],
-    capabilities: ['price_flex']
+await seller.registerNode(
+    'amazon.anp',
+    'https://your-seller-api.com/anp/v1',
+    ['electronics'],
+    ['price_flex'],
+    { supported_modes: ['ANP/C'] }
+);
+
+// Standard incoming handshake hook
+app.post('/anp/v1/handshake', (req, res) => {
+    const { session_id, buyer_pub_key, constraints } = req.body;
+    seller.registerIncomingSession(session_id, buyer_pub_key, constraints);
+    
+    // Evaluate constraints and save state locally
+    seller.updateSessionStateLocally(session_id, NegotiationState.CONFIRMED, 95.00);
+    res.json({ type: 'CONFIRM', price: 95.00 });
 });
 
-// 3. Implement the standard ANP counter-offer endpoint
-app.post('/anp/v1/counter', (req, res) => {
-    const { session_id, turn, price, reason, buyer_sig } = req.body;
-
-    // Cryptographically verify the buyer's ephemeral signature
-    const isValid = seller.verifyBuyerSignature(
-        { session_id, turn, price, reason },
-        buyer_sig,
-        req.headers['x-buyer-pubkey']
-    );
-
-    if (!isValid) return res.status(401).json({ error: "Invalid signature" });
-
-    // Execute bargaining logic and respond
-    res.json({ msg_type: 'counter', price: 95.00, reason: "Best we can offer is $95." });
+// 3. Implement the standard ANP signature endpoint
+app.post('/anp/v1/sign_request', (req, res) => {
+    try {
+        // Cryptographically verifies the buyer signature inside the artifact 
+        // and returns the matching seller co-signature
+        const sellerSignature = seller.signAsSeller(req.body.artifact);
+        res.json({ sellerSignature });
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
 });
 
 app.listen(8080);
@@ -267,23 +291,25 @@ app.listen(8080);
 ### 6.1 `ClinchCore` (Buyer Client)
 
 #### `new ClinchCore(config)`
-*   `config.registryUrl` *(string)*: Optional. Direct override pointing to a local development registry.
-*   `config.timeoutMs` *(number)*: Network connection timeout limit (Default: `5000`ms).
+*   `config.privateKeyHex` *(string, Required)*: The buyer's permanent Ed25519 private key hex.
+*   `config.blindKeys` *(Record<string, string>, Optional)*: Local key-value map of domain credentials to silently inject during handsakes.
+*   `config.registryUrl` *(string, Optional)*: Direct override pointing to a local development registry.
+*   `config.timeoutMs` *(number, Optional)*: Network connection timeout limit (Default: `8000`ms).
 
 #### `async initialize(cachedToken?)`
 Resolves network configurations, computes Proof-of-Work proof, and opens active WebSocket channels.
 *   `cachedToken` *(string)*: Optional. Pastes a previous registry authorization token to skip PoW calculations on startup.
 
-#### `async negotiate(address, constraints)`
-Initializes the cryptographic handshake with a seller. Returns `sessionId`.
-*   `address` *(string)*: Target address formatted strictly as `PROTOCOL_MODE.domain` (e.g., `ANP/C.amazon.anp`).
-*   `constraints` *(ConstraintVector)*: Schema requiring `max_budget` (number) and `item` (string).
+#### `async proposeDeal(targetDomain, constraints)`
+Initializes the cryptographic handshake with a seller. Returns `SessionState` containing `sessionId`.
+*   `targetDomain` *(string)*: Target address formatted strictly as `domain` (e.g., `amazon.anp`).
+*   `constraints` *(ConstraintVector)*: Schema requiring `max_budget` (number | null) and `item` (string).
 
-#### `exportSessionState(sessionId)` / `importSessionState(serializedData)`
-Serializes or de-serializes all in-flight state for a given session, including ephemeral Ed25519 keys, state metrics, and local sandbox parameters, into an exchangeable JSON string.
+#### `exportSessions()` / `importSessions(data)`
+Serializes or de-serializes all in-flight session states globally (including ephemeral Ed25519 keys, state metrics, and local sandbox parameters).
 
-#### `registerSecret(domain, key, name?)` / `clearSecret(domain)`
-Saves or clears an API secret locally. The key is never visible to the AI agent and is silently passed in handshake payloads to the designated domain.
+#### `getSession(sessionId)`
+Returns the `SessionState` dictionary for a targeted session id, or `undefined` if not found.
 
 #### `async negotiateCascade(category, constraints, maxSellers?, strategy?)`
 Queries the discovery register and cascade-negotiates with matching nodes.
@@ -292,25 +318,34 @@ Queries the discovery register and cascade-negotiates with matching nodes.
 #### `buildAgentPrompt(sessionId, incomingMessage)`
 Assembles a contextual, structure-compliant system prompt for external LLMs to ensure compliant JSON execution.
 
-#### `async sendCounter(sessionId, price, reason)`
+#### `async counter(sessionId, price, reason)`
 Signs and dispatches a standard counter-offer to the seller endpoint.
 
-#### `async exitSession(sessionId)`
-Stops the live execution channel and requests a callback token.
+#### `async cancelSession(sessionId)`
+Stops the live execution channel and cleanly cancels the local session state.
+
+#### `async approveAndSign(sessionId)`
+Signs the confirmed deal artifact locally, requests the matching seller co-signature, commits it to the registry, and transitions the session to `SIGNED`.
 
 ---
 
 ### 6.2 `ClinchSeller` (Seller Client)
 
 #### `new ClinchSeller(config)`
-*   `config.privateKeyHex` *(string)*: The permanent Ed25519 private key generated via the registration interface.
-*   `config.registryUrl` *(string)*: Optional. Point to a dev registry for local testing.
+*   `config.privateKeyHex` *(string, Required)*: The permanent Ed25519 private key generated via the registration interface.
+*   `config.registryUrl` *(string, Optional)*: Optional. Point to a dev registry for local testing.
 
-#### `async registerEndpoint(record)`
+#### `async registerNode(agentId, endpoint, categories, capabilities, options?)`
 Locally signs and publishes dynamic endpoint mappings and categories to the discovery registry.
 
-#### `verifyBuyerSignature(payload, signatureHex, buyerPubKeyHex)`
-Verifies that the provided turn payload matches the cryptographic signature produced by the session's ephemeral public key.
+#### `registerIncomingSession(sessionId, targetPubKey, constraints)`
+Saves an incoming session profile into the seller's active local cache state machine.
+
+#### `updateSessionStateLocally(sessionId, state, price, turn?)`
+Mutates the local state of an active negotiation.
+
+#### `signAsSeller(artifact)`
+Verifies the cryptographic buyer signature inside the incoming deal artifact. If verified, returns the matching seller signature.
 
 ---
 
@@ -319,5 +354,5 @@ Verifies that the provided turn payload matches the cryptographic signature prod
 Clinch relies entirely on zero-trust cryptography to maintain buyer privacy and seller authenticity:
 
 1. **Proof-of-Work Binding**: The PoW challenge solution includes the client's public key hash, ensuring challenges cannot be pre-computed or farmed.
-2. **Ephemeral Session Keypairs**: Calling `negotiate()` generates a single-use keypair (`nacl.sign.keyPair()`). This ephemeral key signs every message sent within the session context. In the event of a key compromise, your permanent global identity remains secure, and historical session logs are completely unlinkable.
+2. **Ephemeral Session Keypairs**: Calling `proposeDeal()` generates a single-use keypair (`nacl.sign.keyPair()`). This ephemeral key signs every message sent within the session context. In the event of a key compromise, your permanent global identity remains secure, and historical session logs are completely unlinkable.
 3. **Decoupled Verification**: Agreement artifacts are sequentially co-signed by the buyer's session key, the seller's verified identity key, and countersigned by the active registry key. This provides independent verification offline using only the registry's public key chain.
