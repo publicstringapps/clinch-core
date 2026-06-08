@@ -1,6 +1,6 @@
 {
   "name": "clinch-core",
-  "version": "0.8.4",
+  "version": "0.8.5",
 
   "description": "Clinch Protocol Edge Client",
   "main": "dist/index.js",
