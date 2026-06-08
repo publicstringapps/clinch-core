@@ -6,7 +6,7 @@ import WebSocket from 'ws';
 // ============================================================================
 // CONFIGURATION & UTILS
 // ============================================================================
-const PROTOCOL_VERSION = "0.2.0"; // Bumped version to match your new backend constraints
+const PROTOCOL_VERSION = "0.2.1";
 const FIREBASE_CONFIG_URL = "https://clinchprotocol.web.app/network-config.json";
 
 function toHex(arr: Uint8Array | number[]): string {
@@ -39,14 +39,14 @@ export interface DiscoveryResult {
     endpoint: string;
     categories: string[];
     capabilities: string[];
-    supported_modes: string[] | null; // [FIX]: Replaced tags with supported_modes
+    supported_modes: string[] | null;
     display_name: string | null;
     official_node: boolean;
     reputation_score: number;
 }
 
 export interface RegisterNodeOptions {
-    supported_modes?: string[]; // [FIX]: Replaced tags with supported_modes
+    supported_modes?: string[];
 }
 
 export interface DealArtifact {
@@ -77,6 +77,7 @@ export interface SessionState {
     constraints: ConstraintVector;
     currentTurn: number;
     lastPrice: number;
+    lastMessage?: string | null; // <--- FIXED: Captured for daemon UI
     customInstructions?: string | null;
     artifact: DealArtifact | null;
     seenMessageIds: string[];
@@ -157,11 +158,10 @@ export class ClinchCore extends EventEmitter {
             return this.cachedRegistryUrl!;
         } catch (err: any) {
             clearTimeout(timeout);
-            throw new Error(`Registry config fetch failed: ${err.message}. Is the computer able to access the url?`);
+            throw new Error(`Registry config fetch failed: ${err.message}`);
         }
     }
 
-    // --- TRANSPORT AUTHENTICATION (Anti-Spam PoW) ---
     public async initialize(cachedToken?: string): Promise<void> {
         if (this.status === 'IDLE' || this.status === 'CONNECTING') return;
         this.setStatus('CONNECTING');
@@ -218,7 +218,6 @@ export class ClinchCore extends EventEmitter {
         return zeroBits >= bits;
     }
 
-    // --- NETWORK REQUESTS (Auto-retry on Token Expiry) ---
     private async _makeFetch(baseUrl: string, endpoint: string, method: string, payload: any = {}): Promise<Response> {
         const msgBytes = new TextEncoder().encode(JSON.stringify(payload));
         const sig = toHex(nacl.sign.detached(msgBytes, this.keyPair.secretKey));
@@ -270,38 +269,20 @@ export class ClinchCore extends EventEmitter {
         });
     }
 
-    // --- PROTOCOL CAPABILITIES ---
     public async discover(category: string): Promise<DiscoveryResult[]> {
         const baseUrl = await this.getRegistryUrl();
         const res = await fetch(`${baseUrl}/api/discover?category=${encodeURIComponent(category)}`);
         return (await res.json()).results || [];
     }
 
-    // [FIX]: Added explicit agentId requirement and aligned supported_modes
-    public async registerNode(
-        agentId: string, 
-        endpoint: string,
-        categories: string[],
-        capabilities: string[],
-        options: RegisterNodeOptions = {}
-    ): Promise<void> {
-        const payload = {
-            agent_id: agentId,
-            endpoint,
-            categories,
-            capabilities,
-            supported_modes: options.supported_modes || ["ANP/C"],
-            timestamp: Date.now()
-        };
+    public async registerNode(agentId: string, endpoint: string, categories: string[], capabilities: string[], options: RegisterNodeOptions = {}): Promise<void> {
+        const payload = { agent_id: agentId, endpoint, categories, capabilities, supported_modes: options.supported_modes || ["ANP/C"], timestamp: Date.now() };
         await this.request('/api/sellers/update-endpoint', 'POST', { payload });
     }
 
     public async proposeDeal(targetDomain: string, constraints: ConstraintVector): Promise<SessionState> {
         const payload: any = { target: targetDomain, constraints, timestamp: Date.now() };
-
-        if (this.config.blindKeys && this.config.blindKeys[targetDomain]) {
-            payload.blind_auth_token = this.config.blindKeys[targetDomain];
-        }
+        if (this.config.blindKeys && this.config.blindKeys[targetDomain]) payload.blind_auth_token = this.config.blindKeys[targetDomain];
 
         const res = await this.request(`/api/route/${targetDomain}/handshake`, 'POST', payload);
 
@@ -312,6 +293,7 @@ export class ClinchCore extends EventEmitter {
             constraints,
             currentTurn: 1,
             lastPrice: 0,
+            lastMessage: res.message || null,
             customInstructions: res.custom_instructions || null,
             artifact: null,
             seenMessageIds: []
@@ -328,19 +310,16 @@ export class ClinchCore extends EventEmitter {
     public async counter(sessionId: string, price: number, reason: string): Promise<SessionState> {
         const session = this.sessions.get(sessionId);
         if (!session) throw new Error("Session not found");
-        if (session.state === NegotiationState.SIGNED || session.state === NegotiationState.CANCELLED) {
-            throw new Error(`Cannot counter, deal is ${session.state}`);
-        }
+        if (session.state === NegotiationState.SIGNED || session.state === NegotiationState.CANCELLED) throw new Error(`Cannot counter, deal is ${session.state}`);
 
         const payload: any = { session_id: sessionId, turn: session.currentTurn + 1, price, reason };
-        if (this.config.blindKeys && this.config.blindKeys[session.targetId]) {
-            payload.blind_auth_token = this.config.blindKeys[session.targetId];
-        }
+        if (this.config.blindKeys && this.config.blindKeys[session.targetId]) payload.blind_auth_token = this.config.blindKeys[session.targetId];
 
         const res = await this.request(`/api/route/${session.targetId}/counter`, 'POST', payload);
 
         session.currentTurn++;
         session.lastPrice = price;
+        session.lastMessage = res.message || null;
         session.state = NegotiationState.COUNTERED;
 
         if (res.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = res.price; }
@@ -358,127 +337,6 @@ export class ClinchCore extends EventEmitter {
         return session;
     }
 
-    // --- CASCADING ITERATIVE SQUEEZE ---
-    public async negotiateCascade(
-        category: string,
-        constraints: ConstraintVector,
-        maxSellers = 3,
-        strategy: 'sequential' | 'parallel' = 'sequential'
-    ): Promise<{ sessionId: string, sellerId: string, finalPrice: number } | null> {
-        this.emit('log', `[Cascade] Querying registry for matching sellers under "${category}"...`);
-        const discovery = await this.discover(category);
-        const sellers: DiscoveryResult[] = discovery.slice(0, maxSellers);
-
-        if (sellers.length === 0) return null;
-
-        if (strategy === 'parallel') {
-            const sessionPromises = sellers.map(async (seller: DiscoveryResult) => {
-                try {
-                    const session = await this.proposeDeal(seller.agent_id, constraints);
-                    if (session.state === NegotiationState.CONFIRMED && constraints.max_budget !== null && session.lastPrice <= constraints.max_budget) {
-                        return { sellerId: seller.agent_id, sessionId: session.sessionId, outcome: 'deal', price: session.lastPrice };
-                    }
-                    return { sellerId: seller.agent_id, sessionId: session.sessionId, outcome: 'pending', price: Infinity };
-                } catch (e: any) {
-                    return { sellerId: seller.agent_id, sessionId: '', outcome: 'error', price: Infinity };
-                }
-            });
-
-            const results = await Promise.all(sessionPromises);
-            const successfulDeals = results.filter((r: any) => r.outcome === 'deal');
-            if (successfulDeals.length === 0) return null;
-            successfulDeals.sort((a: any, b: any) => a.price - b.price);
-            const winner = successfulDeals[0];
-            return { sessionId: winner.sessionId, sellerId: winner.sellerId, finalPrice: winner.price };
-        }
-
-        let bestDeal = null;
-        let currentBudgetCeiling = constraints.max_budget || Infinity;
-
-        for (const seller of sellers) {
-            const sessionConstraints = { ...constraints, max_budget: currentBudgetCeiling === Infinity ? null : currentBudgetCeiling };
-            try {
-                const session = await this.proposeDeal(seller.agent_id, sessionConstraints);
-                if (session.state === NegotiationState.CONFIRMED && session.lastPrice < currentBudgetCeiling) {
-                    bestDeal = { sessionId: session.sessionId, sellerId: seller.agent_id, finalPrice: session.lastPrice };
-                    currentBudgetCeiling = session.lastPrice;
-                }
-            } catch (e: any) { this.emit('log', `[Cascade] Error with ${seller.agent_id}: ${e.message}`); }
-        }
-        return bestDeal;
-    }
-
-    // --- AUTO-NEGOTIATOR SANDBOX ---
-    public async sandbox(config: SandboxConfig = {}): Promise<void> {
-        this.isSandboxMode = true;
-        this.sandboxMaxTurns = config.maxTurns || 6;
-        await this.setupSandbox(config);
-
-        this.on('counter_received', async (session: SessionState) => {
-            if (!this.isSandboxMode) return;
-            if (session.constraints.max_budget !== null && session.lastPrice <= session.constraints.max_budget) {
-                this.emit('log', `🎉 [Sandbox] Target met constraints! Suggesting confirmation.`);
-                await this.counter(session.sessionId, session.lastPrice, "I accept this offer.");
-                return;
-            }
-            if (session.currentTurn > this.sandboxMaxTurns) {
-                await this.cancelSession(session.sessionId);
-                return;
-            }
-
-            const promptStr = this.buildAgentPrompt(session.sessionId, `The price is $${session.lastPrice}`);
-            if (!session.sandboxSequence) {
-                session.sandboxSequence = this.sandboxModelContext.getSequence();
-                const { LlamaChatSession, ChatMLChatWrapper } = await import('node-llama-cpp');
-                session.sandboxSession = new LlamaChatSession({ contextSequence: session.sandboxSequence, systemPrompt: promptStr, chatWrapper: new ChatMLChatWrapper() });
-            }
-
-            let responseText = "";
-            await session.sandboxSession.prompt(`The price is $${session.lastPrice}`, { maxTokens: 120, onTextChunk: (chunk: string) => { responseText += chunk; } });
-
-            const match = responseText.match(/"price"\s*:\s*(\d+(?:\.\d{2})?)/i);
-            const parsedOffer = match ? parseFloat(match[1]) : session.lastPrice * 0.9;
-            await this.counter(session.sessionId, parsedOffer, "Counter offer from Sandbox Agent");
-        });
-    }
-
-    private async setupSandbox(config: SandboxConfig = {}): Promise<void> {
-        if (this.sandboxModelContext) return;
-        let nodeLlama;
-        try { nodeLlama = await import('node-llama-cpp'); } catch (e) { throw new Error("Sandbox requires 'node-llama-cpp'."); }
-        const fs = await import('fs');
-        const path = await import('path');
-        const os = await import('os');
-        const resolvedPath = path.resolve(config.modelPath || "./model.gguf");
-
-        if (!fs.existsSync(resolvedPath)) throw new Error(`Model missing at ${resolvedPath}. Download required.`);
-
-        const llama = await nodeLlama.getLlama();
-        const model = await llama.loadModel({ modelPath: resolvedPath });
-        this.sandboxModelContext = await model.createContext({ contextSize: 2048, threads: Math.max(1, os.cpus().length - 1) });
-    }
-
-    public buildAgentPrompt(sessionId: string, incomingMessage: string): string {
-        const session = this.sessions.get(sessionId);
-        if (!session) return "";
-        const budgetText = session.constraints.max_budget ? `$${session.constraints.max_budget}` : `Unspecified (get best deal)`;
-        const customInstructionsBlock = session.customInstructions ? `\nCUSTOM SELLER INSTRUCTIONS:\n"""\n${session.customInstructions}\n"""\n` : "";
-
-        return `You are a professional AI purchasing agent negotiating via the Clinch Protocol.
-NEGOTIATION STATE:
-- Item: ${session.constraints.item}
-- Your absolute max budget: ${budgetText}
-- Current turn: ${session.currentTurn}
-- Last seller price: $${session.lastPrice}
-${customInstructionsBlock}
-SELLER'S LATEST MESSAGE: "${incomingMessage}"
-
-OUTPUT FORMAT:
-You MUST respond ONLY in valid JSON matching this exact schema:
-{"action": "counter" | "accept" | "exit", "price": <numeric value>, "message": "<One concise sentence>"}`;
-    }
-
-    // --- LOCAL SELLER STATE MANAGEMENT ---
     public registerIncomingSession(sessionId: string, targetPubKey: string, constraints: any): void {
         if (!this.sessions.has(sessionId)) {
             this.sessions.set(sessionId, { sessionId, targetId: targetPubKey, state: NegotiationState.NEGOTIATING, constraints, currentTurn: 1, lastPrice: 0, artifact: null, seenMessageIds: [] });
@@ -490,7 +348,6 @@ You MUST respond ONLY in valid JSON matching this exact schema:
         if (session) { session.state = state; session.lastPrice = price; if (turn) session.currentTurn = turn; }
     }
 
-    // --- BILATERAL SIGNATURE & COMMIT ---
     public async approveAndSign(sessionId: string): Promise<DealArtifact> {
         const session = this.sessions.get(sessionId);
         if (!session) throw new Error("Session not found");
@@ -528,7 +385,6 @@ You MUST respond ONLY in valid JSON matching this exact schema:
         if (!nacl.sign.detached.verify(msgBytes, fromHex(artifact.buyerSignature), fromHex(artifact.buyerPubKey))) {
             throw new Error("Cryptographic verification of buyer signature failed");
         }
-
         return toHex(nacl.sign.detached(msgBytes, this.keyPair.secretKey));
     }
 
@@ -549,17 +405,17 @@ You MUST respond ONLY in valid JSON matching this exact schema:
         }
 
         if (payload.type === 'CANCEL') { session.state = NegotiationState.CANCELLED; this.emit('session_cancelled', session); }
-        else if (payload.type === 'COUNTER') { session.state = NegotiationState.COUNTERED; session.lastPrice = payload.price; session.currentTurn = payload.turn; this.emit('counter_received', session); }
-        else if (payload.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = payload.price; this.emit('approval_required', session); }
+        else if (payload.type === 'COUNTER') { 
+            session.state = NegotiationState.COUNTERED; 
+            session.lastPrice = payload.price; 
+            session.currentTurn = payload.turn; 
+            session.lastMessage = payload.message || null; // <--- FIXED
+            this.emit('counter_received', session); 
+        }
+        else if (payload.type === 'CONFIRM') { session.state = NegotiationState.CONFIRMED; session.lastPrice = payload.price; session.lastMessage = payload.message || null; this.emit('approval_required', session); }
         else if (payload.type === 'COMMIT') { session.state = NegotiationState.SIGNED; session.artifact = payload.artifact; this.emit('deal_signed', session); }
     }
 }
-
-// ============================================================================
-// THE CLINCH SELLER LIBRARY (EXPORT WRAPPER)
-// ============================================================================
 export class ClinchSeller extends ClinchCore {
-    constructor(config: CoreConfig) {
-        super(config);
-    }
+    constructor(config: CoreConfig) { super(config); }
 }
